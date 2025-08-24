@@ -1,0 +1,51 @@
+# OS
+.DS_Store
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Node.js
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build/coverage/output
+build/
+dist/
+coverage/
+*.log
+.cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.env.*
+
+# RT-Lakehouse generated data
+rt-lakehouse/data/
+rt-lakehouse/data/*
+rt-lakehouse/data/delta/
+rt-lakehouse/data/checkpoints/
+rt-lakehouse/data/kafka/
+rt-lakehouse/data/zookeeper/
+rt-lakehouse/data/qdrant/
+
+# Frontend build artifacts
+rt-lakehouse/services/frontend/build/

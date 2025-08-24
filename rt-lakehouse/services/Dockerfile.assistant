@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install
+COPY services/requirements-assistant.txt .
+RUN pip install --no-cache-dir -r requirements-assistant.txt
+
+# Copy assistant code
+COPY services/assistant_api.py ./assistant_api.py
+
+# Expose port
+EXPOSE 8000
+
+# Run FastAPI
+CMD ["uvicorn", "assistant_api:app", "--host", "0.0.0.0", "--port", "8000"]

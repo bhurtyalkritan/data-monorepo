@@ -1,0 +1,8 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+databricks-sql-connector==2.9.6
+requests==2.32.3
+python-dotenv==1.0.1
+pandas==2.2.2
+matplotlib==3.8.4
+plotly==5.22.0

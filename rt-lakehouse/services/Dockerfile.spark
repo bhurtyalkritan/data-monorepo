@@ -1,0 +1,25 @@
+FROM apache/spark:3.5.1-scala2.12-java11-python3-ubuntu
+
+USER root
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages
+RUN pip install --no-cache-dir \
+    delta-spark==3.2.0 \
+    pyspark==3.5.1 \
+    duckdb==0.10.0 \
+    kafka-python==2.0.2
+
+# Copy Spark streaming code
+COPY pipelines/ /app/pipelines/
+COPY services/spark_runner.py /app/
+
+WORKDIR /app
+
+# Run streaming pipeline
+CMD ["python", "spark_runner.py"]

@@ -24,6 +24,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3.1-8b-instruct:free")
 
+# Parquet paths produced by Spark
+SILVER_PARQUET = "/delta/silver_latest.parquet"
+GOLD_PARQUET = "/delta/gold_latest.parquet"
+
 # FastAPI app
 app = FastAPI(title="RT-Lakehouse Assistant API", version="1.0.0")
 
@@ -41,6 +45,9 @@ duckdb_conn = None
 qdrant_client = None
 openai_client = None
 
+# Background task handle
+_views_refresh_task: Optional[asyncio.Task] = None
+
 class QueryRequest(BaseModel):
     question: str
     include_chart: bool = True
@@ -51,6 +58,40 @@ class QueryResponse(BaseModel):
     explanation: str
     chart_config: Optional[Dict[str, Any]] = None
 
+def setup_duckdb_views():
+    """Create or refresh DuckDB views only when parquet files exist."""
+    global duckdb_conn
+    if duckdb_conn is None:
+        return
+
+    try:
+        if os.path.exists(SILVER_PARQUET):
+            duckdb_conn.execute(
+                """
+                CREATE OR REPLACE VIEW silver_events AS 
+                SELECT * FROM read_parquet(?)
+                """,
+                [SILVER_PARQUET],
+            )
+            logger.info("DuckDB view 'silver_events' is ready")
+        else:
+            logger.info("Waiting for parquet %s to appear...", SILVER_PARQUET)
+
+        if os.path.exists(GOLD_PARQUET):
+            duckdb_conn.execute(
+                """
+                CREATE OR REPLACE VIEW gold_kpis AS 
+                SELECT * FROM read_parquet(?)
+                """,
+                [GOLD_PARQUET],
+            )
+            logger.info("DuckDB view 'gold_kpis' is ready")
+        else:
+            logger.info("Waiting for parquet %s to appear...", GOLD_PARQUET)
+
+    except Exception as e:
+        logger.warning(f"DuckDB view setup skipped/failed: {e}")
+
 def init_connections():
     """Initialize database connections"""
     global duckdb_conn, qdrant_client, openai_client
@@ -58,19 +99,10 @@ def init_connections():
     try:
         # DuckDB
         duckdb_conn = duckdb.connect(DUCKDB_PATH)
-        
-        # Setup views for Delta parquet files
-        duckdb_conn.execute("""
-            CREATE OR REPLACE VIEW silver_events AS 
-            SELECT * FROM read_parquet('/delta/silver_latest.parquet')
-        """)
-        
-        duckdb_conn.execute("""
-            CREATE OR REPLACE VIEW gold_kpis AS 
-            SELECT * FROM read_parquet('/delta/gold_latest.parquet')
-        """)
-        
-        logger.info("DuckDB connected successfully")
+        logger.info("DuckDB connected successfully at %s", DUCKDB_PATH)
+
+        # Try to set up views (will be retried in background if parquet is missing)
+        setup_duckdb_views()
         
         # Qdrant
         qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
@@ -316,8 +348,21 @@ def generate_chart_config(sql: str, results: List[Dict]) -> Optional[Dict]:
 
 @app.on_event("startup")
 async def startup():
-    """Initialize connections on startup"""
+    """Initialize connections on startup and start background view refresh."""
+    global _views_refresh_task
     init_connections()
+
+    async def refresh_views_loop():
+        while True:
+            try:
+                setup_duckdb_views()
+            except Exception as e:
+                logger.debug("View refresh loop error: %s", e)
+            await asyncio.sleep(15)
+
+    # Start loop once
+    if _views_refresh_task is None:
+        _views_refresh_task = asyncio.create_task(refresh_views_loop())
 
 @app.get("/health")
 async def health_check():
@@ -381,29 +426,44 @@ async def get_current_metrics():
     """Get current system metrics"""
     try:
         # Latest KPIs
-        latest_kpis = duckdb_conn.execute("""
+        cur = duckdb_conn.execute(
+            """
             SELECT * FROM gold_kpis 
             ORDER BY window_start DESC 
             LIMIT 1
-        """).fetchone()
+            """
+        )
+        latest_kpis_row = cur.fetchone()
+        latest_cols = [d[0] for d in cur.description] if cur.description else []
+        latest_kpis = dict(zip(latest_cols, latest_kpis_row)) if latest_kpis_row else {}
         
-        # Event counts
-        event_counts = duckdb_conn.execute("""
+        # Event counts (last hour)
+        cur2 = duckdb_conn.execute(
+            """
             SELECT event_type, COUNT(*) as count
             FROM silver_events 
             WHERE ts >= NOW() - INTERVAL '1 hour'
             GROUP BY event_type
-        """).fetchall()
+            """
+        )
+        event_counts_rows = cur2.fetchall()
+        recent_events = {row[0]: row[1] for row in event_counts_rows} if event_counts_rows else {}
         
         return {
-            "latest_kpis": dict(zip([desc[0] for desc in duckdb_conn.description], latest_kpis)) if latest_kpis else {},
-            "recent_events": {row[0]: row[1] for row in event_counts}
+            "latest_kpis": latest_kpis,
+            "recent_events": recent_events,
         }
         
     except Exception as e:
-        logger.error(f"Failed to get metrics: {e}")
+        logger.warning(f"Failed to get metrics (likely views not ready yet): {e}")
         return {"latest_kpis": {}, "recent_events": {}}
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        import uvicorn  # type: ignore
+    except ImportError:
+        uvicorn = None  # type: ignore
+    if uvicorn is None:
+        print("Uvicorn is not installed in this environment.")
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=8000)

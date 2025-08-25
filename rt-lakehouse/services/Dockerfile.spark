@@ -22,4 +22,4 @@ COPY services/spark_runner.py /app/
 WORKDIR /app
 
 # Run streaming pipeline
-CMD ["python", "spark_runner.py"]
+CMD ["python3", "spark_runner.py"]

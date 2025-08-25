@@ -1,17 +1,4 @@
 services:
-  # DuckDB + Delta Lake data warehouse
-  duckdb:
-    image: duckdb/duckdb:latest
-    container_name: rt_duckdb
-    volumes:
-      - ./data/duckdb:/data
-      - ./data/delta:/delta
-    ports:
-      - "5432:5432"
-    environment:
-      - DUCKDB_DATABASE=/data/lakehouse.db
-    restart: unless-stopped
-
   # Qdrant vector database
   qdrant:
     image: qdrant/qdrant:latest
@@ -75,7 +62,6 @@ services:
     container_name: rt_spark
     depends_on:
       - kafka
-      - duckdb
     volumes:
       - ./data/delta:/delta
       - ./data/checkpoints:/checkpoints
@@ -93,7 +79,6 @@ services:
       dockerfile: services/Dockerfile.assistant
     container_name: rt_assistant
     depends_on:
-      - duckdb
       - qdrant
     ports:
       - "8000:8000"
@@ -115,7 +100,6 @@ services:
     depends_on:
       - assistant-api
       - qdrant
-      - duckdb
     ports:
       - "3000:3000"
     environment:
@@ -131,7 +115,6 @@ services:
     container_name: rt_monitoring
     depends_on:
       - kafka
-      - duckdb
       - qdrant
       - assistant-api
     ports:
@@ -146,7 +129,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  duckdb_data:
   qdrant_data:
   delta_data:
   checkpoints:

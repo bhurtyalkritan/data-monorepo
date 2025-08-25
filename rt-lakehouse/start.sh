@@ -43,25 +43,26 @@ echo "🚀 Starting core infrastructure services..."
 docker-compose up -d zookeeper kafka
 
 echo "⏱️  Waiting for Kafka to be ready..."
-sleep 30
 
-# Check if Kafka is ready
-while ! docker-compose exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1; do
-    echo "   Waiting for Kafka..."
-    sleep 5
+# Wait up to ~5 minutes for Kafka to become available on the internal listener
+for i in {1..60}; do
+  if docker-compose exec -T kafka bash -lc "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1 || kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1"; then
+    echo "✅ Kafka is ready!"
+    break
+  fi
+  echo "   Waiting for Kafka..."
+  sleep 5
 done
 
-echo "✅ Kafka is ready!"
+if [ "$i" -eq 60 ]; then
+  echo "❌ Kafka failed to become ready in time. Showing recent logs:"
+  docker-compose logs --tail=200 kafka || true
+  exit 1
+fi
 
 # Create Kafka topic
 echo "📝 Creating Kafka topic..."
-docker-compose exec kafka kafka-topics.sh \
-    --bootstrap-server localhost:9092 \
-    --create \
-    --topic ecommerce_events \
-    --partitions 3 \
-    --replication-factor 1 \
-    --if-not-exists
+docker-compose exec -T kafka bash -lc "kafka-topics --bootstrap-server localhost:9092 --create --topic ecommerce_events --partitions 3 --replication-factor 1 --if-not-exists || kafka-topics --bootstrap-server kafka:29092 --create --topic ecommerce_events --partitions 3 --replication-factor 1 --if-not-exists"
 
 echo "🗄️  Starting databases..."
 docker-compose up -d qdrant
@@ -70,7 +71,7 @@ echo "⏱️  Waiting for Qdrant to be ready..."
 sleep 10
 
 echo "🔥 Starting Spark streaming pipeline..."
-docker-compose up -d spark
+docker-compose up -d spark-streaming
 
 echo "⏱️  Waiting for Spark to initialize..."
 sleep 20

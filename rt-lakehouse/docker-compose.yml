@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # DuckDB + Delta Lake data warehouse
   duckdb:
@@ -137,7 +135,7 @@ services:
       - qdrant
       - assistant-api
     ports:
-      - "8080:8080"
+      - "8501:8501"
     environment:
       - KAFKA_URL=kafka:29092
       - DUCKDB_PATH=/delta/lakehouse.db

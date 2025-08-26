@@ -16,6 +16,12 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "ecommerce_events")
 DELTA_PATH = os.getenv("DELTA_PATH", "/delta")
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "/delta/lakehouse.db")
 
+# Tunables
+SILVER_WATERMARK = os.getenv("SILVER_WATERMARK", "10 minutes")
+GOLD_WATERMARK = os.getenv("GOLD_WATERMARK", "30 seconds")
+ENABLE_GOLD_MERGE_BACKFILL = os.getenv("ENABLE_GOLD_MERGE_BACKFILL", "0").lower() in ("1","true","yes")
+MERGE_INTERVAL_SEC = int(os.getenv("MERGE_INTERVAL_SEC", "120"))
+
 # Event schema
 event_schema = StructType([
     StructField("event_id", StringType()),
@@ -39,7 +45,8 @@ def create_spark_session():
         .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true"))
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.adaptive.skewJoin.enabled", "true"))
     
     return configure_spark_with_delta_pip(builder).getOrCreate()
 
@@ -131,7 +138,7 @@ def run_silver_pipeline(spark):
     
     # Dedupe
     deduped = (clean
-        .withWatermark("ts", "10 minutes")
+        .withWatermark("ts", SILVER_WATERMARK)
         .dropDuplicates(["event_id"]))
     
     # Write to Delta
@@ -160,7 +167,7 @@ def run_gold_pipeline(spark):
     events = (spark.readStream
               .format("delta")
               .load(silver_path)
-              .withWatermark("ts", "30 seconds"))
+              .withWatermark("ts", GOLD_WATERMARK))
     
     # 1-minute windows
     win = F.window("ts", "1 minute")
@@ -226,6 +233,46 @@ def setup_duckdb_integration(spark):
     except Exception as e:
         logger.warning(f"DuckDB integration setup failed: {e}")
 
+def run_gold_incremental_merge(spark):
+    """Optional DP-style incremental upsert into gold table (disabled by default).
+    WARNING: Running alongside a streaming writer to the same path can cause contention.
+    Enable only if you disable the streaming gold writer, or schedule during idle windows.
+    """
+    silver_path = f"{DELTA_PATH}/silver_events"
+    gold_path = f"{DELTA_PATH}/gold_kpis"
+
+    try:
+        silver_df = spark.read.format("delta").load(silver_path)
+        minute_agg = (
+            silver_df
+            .withColumn("window_start", F.date_trunc("minute", F.col("ts").cast("timestamp")))
+            .groupBy("window_start")
+            .agg(
+                F.sum(F.when(F.col("event_type")=="purchase", 1).otherwise(0)).alias("orders"),
+                F.sum(F.when(F.col("event_type")=="purchase", F.col("price")*F.col("quantity")).otherwise(0.0)).alias("gmv"),
+                F.countDistinct(F.when(F.col("event_type")=="purchase", F.col("user_id"))).alias("purchase_users"),
+                F.countDistinct(F.when(F.col("event_type")=="page_view", F.col("user_id"))).alias("view_users"),
+                F.countDistinct("user_id").alias("active_users")
+            )
+            .withColumn(
+                "conversion_rate",
+                (F.col("purchase_users") / F.when(F.col("view_users")==0, F.lit(1)).otherwise(F.col("view_users"))).cast("double")
+            )
+            .withColumn("window_end", F.col("window_start") + F.expr("INTERVAL 1 MINUTE"))
+            .select("window_start","window_end","orders","gmv","purchase_users","view_users","active_users","conversion_rate")
+        )
+        minute_agg.createOrReplaceTempView("minute_agg")
+        spark.sql(f"""
+        MERGE INTO delta.`{gold_path}` AS g
+        USING minute_agg AS m
+        ON g.window_start = m.window_start
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+        """)
+        logger.info("Gold incremental MERGE completed")
+    except Exception as e:
+        logger.warning(f"Gold incremental MERGE failed: {e}")
+
 def main():
     """Main streaming pipeline runner"""
     logger.info("Starting RT-Lakehouse streaming pipeline...")
@@ -247,6 +294,18 @@ def main():
         time.sleep(10)  # Let silver start
         
         gold_query = run_gold_pipeline(spark)
+        
+        # Optional: background incremental MERGE job (disabled by default)
+        if ENABLE_GOLD_MERGE_BACKFILL:
+            import threading
+            def _merge_loop():
+                while True:
+                    try:
+                        run_gold_incremental_merge(spark)
+                    except Exception as e:
+                        logger.error(f"Merge loop error: {e}")
+                    time.sleep(max(10, MERGE_INTERVAL_SEC))
+            threading.Thread(target=_merge_loop, daemon=True).start()
         
         # Setup DuckDB integration (periodic)
         def update_duckdb():

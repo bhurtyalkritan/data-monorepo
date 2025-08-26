@@ -1,605 +1,553 @@
 import os
-import asyncio
-import logging
-from typing import List, Dict, Any, Optional
-import json
+import re
 import glob
+import json
+import time
+import asyncio
+import hashlib
+import logging
+from collections import deque
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import duckdb
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from openai import AsyncOpenAI
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, StreamingResponse
 
-# Configure logging
+# -----------------------------------------------------
+# Logging & env
+# -----------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("assistant_api")
 
-# Environment
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "/delta/lakehouse.db")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3.1-8b-instruct:free")
-
-# Parquet paths produced by Spark
 SILVER_PARQUET = "/delta/silver_latest.parquet"
 GOLD_PARQUET = "/delta/gold_latest.parquet"
 SILVER_PARQUET_GLOB = f"{SILVER_PARQUET}/*.parquet"
 GOLD_PARQUET_GLOB = f"{GOLD_PARQUET}/*.parquet"
 
-# FastAPI app
-app = FastAPI(title="RT-Lakehouse Assistant API", version="1.0.0")
+CONVERSION_ALERT_THRESHOLD = float(os.getenv("CONVERSION_ALERT_THRESHOLD", "0.05"))  # 5%
+CONVERSION_ALERT_WINDOW = int(os.getenv("CONVERSION_ALERT_WINDOW", "5"))  # last N minutes
 
-# CORS
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "60"))   # requests per window
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60")) # seconds
+
+# -----------------------------------------------------
+# App & CORS
+# -----------------------------------------------------
+app = FastAPI(title="RT-Lakehouse Assistant API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-# Clients
-duckdb_conn = None
-qdrant_client = None
-openai_client = None
+# -----------------------------------------------------
+# Globals
+# -----------------------------------------------------
+duckdb_conn: Optional[duckdb.DuckDBPyConnection] = None
+_cache: Dict[str, Dict[str, Any]] = {}
+_cache_stats = {"hits": 0, "misses": 0}
+_rate_buckets: Dict[str, deque] = {}
+_start_time = time.time()
 
-# Background task handle
-_views_refresh_task: Optional[asyncio.Task] = None
+# -----------------------------------------------------
+# Helpers
+# -----------------------------------------------------
 
-class QueryRequest(BaseModel):
-    question: str
-    include_chart: bool = True
+def cached(key: str, ttl: int, loader):
+    now = time.time()
+    entry = _cache.get(key)
+    if entry and (now - entry.get("t", 0)) < ttl:
+        _cache_stats["hits"] += 1
+        return entry["v"], True
+    v = loader()
+    _cache[key] = {"v": v, "t": now}
+    _cache_stats["misses"] += 1
+    return v, False
 
-class QueryResponse(BaseModel):
-    sql: str
-    results: List[Dict[str, Any]]
-    explanation: str
-    chart_config: Optional[Dict[str, Any]] = None
+
+def etag_for(sql: Optional[str] = None) -> str:
+    parts = []
+    if sql:
+        parts.append(hashlib.sha256(sql.encode()).hexdigest()[:16])
+    mtimes = [os.path.getmtime(p) for p in glob.glob(GOLD_PARQUET_GLOB)]
+    mtimes += [os.path.getmtime(p) for p in glob.glob(SILVER_PARQUET_GLOB)]
+    parts.append(str(int(max(mtimes) if mtimes else 0)))
+    return "W/" + "-".join(parts)
+
+
+def ratelimit(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    bucket = _rate_buckets.setdefault(ip, deque())
+    now = time.time()
+    while bucket and now - bucket[0] > RATE_WINDOW:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    bucket.append(now)
+
 
 def setup_duckdb_views():
-    """Create or refresh DuckDB views only when parquet files exist."""
-    global duckdb_conn
     if duckdb_conn is None:
         return
-
     try:
-        # Use glob to verify there are parquet files and to build the view over all parts
         if glob.glob(SILVER_PARQUET_GLOB):
             duckdb_conn.execute(
                 f"""
-                CREATE OR REPLACE VIEW silver_events AS 
+                CREATE OR REPLACE VIEW silver_events AS
                 SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')
                 """
             )
-            logger.info("DuckDB view 'silver_events' is ready")
-        else:
-            logger.debug("No parquet files found for silver at pattern %s", SILVER_PARQUET_GLOB)
-
         if glob.glob(GOLD_PARQUET_GLOB):
             duckdb_conn.execute(
                 f"""
-                CREATE OR REPLACE VIEW gold_kpis AS 
+                CREATE OR REPLACE VIEW gold_kpis AS
                 SELECT * FROM read_parquet('{GOLD_PARQUET_GLOB}')
                 """
             )
-            logger.info("DuckDB view 'gold_kpis' is ready")
-        else:
-            logger.debug("No parquet files found for gold at pattern %s", GOLD_PARQUET_GLOB)
-
     except Exception as e:
-        logger.warning(f"DuckDB view setup skipped/failed: {e}")
+        logger.warning("View setup failed: %s", e)
 
-def init_connections():
-    """Initialize database connections"""
-    global duckdb_conn, qdrant_client, openai_client
-    
-    try:
-        # DuckDB
-        duckdb_conn = duckdb.connect(DUCKDB_PATH)
-        logger.info("DuckDB connected successfully at %s", DUCKDB_PATH)
 
-        # Try to set up views (will be retried in background if parquet is missing)
-        setup_duckdb_views()
-        
-        # Qdrant
-        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-        
-        # Ensure collection exists
-        try:
-            qdrant_client.get_collection("sql_knowledge")
-        except:
-            qdrant_client.recreate_collection(
-                collection_name="sql_knowledge",
-                vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
-            )
-            
-            # Seed with basic knowledge
-            seed_knowledge_base()
-        
-        logger.info("Qdrant connected successfully")
-        
-        # OpenAI
-        if OPENAI_API_KEY:
-            openai_client = AsyncOpenAI(
-                api_key=OPENAI_API_KEY,
-                base_url=OPENAI_BASE_URL
-            )
-            logger.info("OpenAI client initialized")
-        else:
-            logger.warning("No OpenAI API key provided")
-            
-    except Exception as e:
-        logger.error(f"Failed to initialize connections: {e}")
-        raise
+def init_duckdb():
+    global duckdb_conn
+    duckdb_conn = duckdb.connect(DUCKDB_PATH)
+    logger.info("DuckDB connected at %s", DUCKDB_PATH)
+    setup_duckdb_views()
 
-def seed_knowledge_base():
-    """Seed Qdrant with basic SQL knowledge"""
-    knowledge_items = [
-        {
-            "text": "silver_events table contains raw ecommerce events with columns: event_id, user_id, product_id, event_type, price, quantity, currency, ts, ua, country",
-            "metadata": {"table": "silver_events", "type": "schema"}
-        },
-        {
-            "text": "gold_kpis table contains aggregated metrics with columns: window_start, window_end, orders, gmv, purchase_users, view_users, active_users, conversion_rate",
-            "metadata": {"table": "gold_kpis", "type": "schema"}
-        },
-        {
-            "text": "To get conversion rate trends, use gold_kpis table and look at conversion_rate column over time windows",
-            "metadata": {"pattern": "conversion_rate", "type": "query_pattern"}
-        },
-        {
-            "text": "To analyze user behavior, join silver_events by user_id and analyze event_type sequences",
-            "metadata": {"pattern": "user_behavior", "type": "query_pattern"}
-        },
-        {
-            "text": "For revenue analysis, filter silver_events where event_type='purchase' and calculate price * quantity",
-            "metadata": {"pattern": "revenue", "type": "query_pattern"}
-        }
-    ]
-    
-    points = []
-    for i, item in enumerate(knowledge_items):
-        # In a real implementation, you'd use actual embeddings
-        # For now, use dummy vectors
-        vector = [0.1] * 1536  # Placeholder vector
-        
-        points.append(
-            PointStruct(
-                id=i,
-                vector=vector,
-                payload=item
-            )
-        )
-    
-    qdrant_client.upsert(collection_name="sql_knowledge", points=points)
-    logger.info("Knowledge base seeded")
-
-async def get_embeddings(text: str) -> List[float]:
-    """Get embeddings for text"""
-    if not openai_client:
-        # Return dummy embedding
-        return [0.1] * 1536
-    
-    try:
-        response = await openai_client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=text
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Embedding failed: {e}")
-        return [0.1] * 1536
-
-def search_knowledge(query: str, limit: int = 3) -> List[Dict]:
-    """Search knowledge base for relevant SQL patterns"""
-    try:
-        # Get query embedding - use dummy embedding to avoid asyncio issues
-        query_vector = [0.1] * 1536  # Placeholder until we fix the async embedding
-        
-        # Search Qdrant
-        results = qdrant_client.search(
-            collection_name="sql_knowledge",
-            query_vector=query_vector,
-            limit=limit
-        )
-        
-        return [hit.payload for hit in results]
-    except Exception as e:
-        logger.error(f"Knowledge search failed: {e}")
-        return []
-
-async def generate_sql(question: str, context: List[Dict]) -> tuple[str, str]:
-    """Generate SQL query from natural language question"""
-    if not openai_client:
-        # Fallback SQL for common questions avoiding dependency on views
-        if "conversion" in question.lower():
-            return f"""
-                SELECT window_start, conversion_rate 
-                FROM read_parquet('{GOLD_PARQUET_GLOB}')
-                ORDER BY window_start DESC 
-                LIMIT 10
-            """, "Showing recent conversion rates"
-        else:
-            return (
-                f"SELECT COUNT(*) as total_events FROM read_parquet('{SILVER_PARQUET_GLOB}')",
-                "Total events count"
-            )
-    
-    # Build context
-    context_text = "\n".join([item["text"] for item in context])
-    
-    prompt = f"""
-You are a SQL expert for an ecommerce analytics lakehouse. Generate a DuckDB SQL query to answer the user's question.
-
-Available tables:
-- silver_events: Raw events (event_id, user_id, product_id, event_type, price, quantity, currency, ts, ua, country)
-- gold_kpis: Aggregated KPIs (window_start, window_end, orders, gmv, purchase_users, view_users, active_users, conversion_rate)
-
-Context from knowledge base:
-{context_text}
-
-User Question: {question}
-
-Requirements:
-1. Return valid DuckDB SQL only
-2. Use proper time filtering if asking about recent data
-3. Limit results to reasonable amounts (usually LIMIT 100)
-4. Use appropriate aggregations
-
-SQL:
-"""
-
-    try:
-        response = await openai_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.1
-        )
-        
-        sql = response.choices[0].message.content.strip()
-        
-        # Clean up SQL (remove markdown formatting)
-        if "```sql" in sql:
-            sql = sql.split("```sql")[1].split("```")[0].strip()
-        elif "```" in sql:
-            sql = sql.split("```")[1].strip()
-            
-        # Generate explanation
-        explanation = f"Generated SQL query to answer: {question}"
-        
-        return sql, explanation
-        
-    except Exception as e:
-        logger.error(f"SQL generation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate SQL: {e}")
-
-def validate_sql(sql: str) -> bool:
-    """Basic SQL validation"""
-    sql_lower = sql.lower().strip()
-    
-    # Block dangerous operations
-    dangerous = ["drop", "delete", "truncate", "insert", "update", "create", "alter"]
-    if any(word in sql_lower for word in dangerous):
-        return False
-    
-    # Must be a SELECT
-    if not sql_lower.startswith("select"):
-        return False
-        
-    return True
-
-def execute_sql(sql: str) -> List[Dict[str, Any]]:
-    """Execute SQL query safely"""
-    if not validate_sql(sql):
-        raise HTTPException(status_code=400, detail="Invalid or unsafe SQL query")
-    
-    try:
-        cursor = duckdb_conn.execute(sql)
-        columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        
-        # Convert to list of dicts
-        results = []
-        for row in rows:
-            results.append(dict(zip(columns, row)))
-            
-        return results
-        
-    except Exception as e:
-        logger.error(f"SQL execution failed: {e}")
-        raise HTTPException(status_code=400, detail=f"SQL execution error: {e}")
-
-def generate_chart_config(sql: str, results: List[Dict]) -> Optional[Dict]:
-    """Generate chart configuration based on query results"""
-    if not results:
-        return None
-    
-    # Simple heuristics for chart type
-    columns = list(results[0].keys())
-    
-    # Time series chart
-    time_cols = [col for col in columns if 'time' in col.lower() or 'date' in col.lower() or 'window' in col.lower()]
-    numeric_cols = [col for col in columns if isinstance(results[0].get(col), (int, float))]
-    
-    if time_cols and numeric_cols:
-        return {
-            "type": "line",
-            "x": time_cols[0],
-            "y": numeric_cols[0],
-            "title": f"{numeric_cols[0]} over time"
-        }
-    elif len(numeric_cols) >= 2:
-        return {
-            "type": "scatter",
-            "x": numeric_cols[0],
-            "y": numeric_cols[1],
-            "title": f"{numeric_cols[1]} vs {numeric_cols[0]}"
-        }
-    elif len(columns) == 2 and len(results) <= 20:
-        return {
-            "type": "bar",
-            "x": columns[0],
-            "y": columns[1],
-            "title": f"{columns[1]} by {columns[0]}"
-        }
-    
-    return None
 
 @app.on_event("startup")
 async def startup():
-    """Initialize connections on startup and start background view refresh."""
-    global _views_refresh_task
-    init_connections()
+    init_duckdb()
 
     async def refresh_views_loop():
         while True:
             try:
                 setup_duckdb_views()
             except Exception as e:
-                logger.debug("View refresh loop error: %s", e)
+                logger.debug("refresh views error: %s", e)
             await asyncio.sleep(15)
 
-    # Start loop once
-    if _views_refresh_task is None:
-        _views_refresh_task = asyncio.create_task(refresh_views_loop())
+    asyncio.create_task(refresh_views_loop())
 
+# -----------------------------------------------------
+# Health & stats
+# -----------------------------------------------------
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+async def health():
     return {"status": "healthy", "service": "assistant-api"}
 
-@app.post("/query", response_model=QueryResponse)
-async def query_data(request: QueryRequest):
-    """Main query endpoint"""
-    try:
-        # Search knowledge base
-        context = search_knowledge(request.question)
-        
-        # Generate SQL
-        sql, explanation = await generate_sql(request.question, context)
-        
-        # Execute SQL
-        results = execute_sql(sql)
-        
-        # Generate chart config if requested
-        chart_config = None
-        if request.include_chart:
-            chart_config = generate_chart_config(sql, results)
-        
-        return QueryResponse(
-            sql=sql,
-            results=results,
-            explanation=explanation,
-            chart_config=chart_config
+@app.get("/healthz")
+async def healthz():
+    return {
+        "duckdb": True,
+        "silver_parquet_parts": len(glob.glob(SILVER_PARQUET_GLOB)),
+        "gold_parquet_parts": len(glob.glob(GOLD_PARQUET_GLOB)),
+        "uptime_sec": int(time.time() - _start_time),
+        "cache_stats": _cache_stats,
+        "rate_limit": {"limit": RATE_LIMIT, "window": RATE_WINDOW},
+    }
+
+# -----------------------------------------------------
+# DQ, lineage, optimizer advice, alerts
+# -----------------------------------------------------
+@app.get("/dq/status")
+async def dq_status(request: Request):
+    ratelimit(request)
+
+    def load():
+        q = f"""
+        WITH s AS (
+          SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')
+        ), l AS (
+          SELECT max(ts) AS mx FROM s
+        ), last_hour AS (
+          SELECT * FROM s, l
+          WHERE CAST(ts AS TIMESTAMP) >= date_trunc('minute', CAST(mx AS TIMESTAMP)) - INTERVAL '1 hour'
         )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        SELECT
+          COALESCE(SUM(CASE WHEN user_id IS NULL THEN 1 ELSE 0 END)::DOUBLE / NULLIF(COUNT(*),0) * 100, 0.0) AS null_user_pct,
+          SUM(CASE WHEN event_type NOT IN ('page_view','add_to_cart','purchase') THEN 1 ELSE 0 END) AS quarantined_1h,
+          SUM(CASE WHEN CAST(ts AS TIMESTAMP) < mx - INTERVAL '5 minutes' THEN 1 ELSE 0 END) AS late_1h
+        FROM last_hour
+        """
+        row = duckdb_conn.execute(q).fetchone()
+        cols = [d[0] for d in duckdb_conn.description]
+        return dict(zip(cols, row)) if row else {"null_user_pct": 0.0, "quarantined_1h": 0, "late_1h": 0}
 
-@app.get("/tables")
-async def list_tables():
-    """List available tables and their schemas"""
-    try:
-        # Get table info
-        tables = duckdb_conn.execute("SHOW TABLES").fetchall()
-        
-        schema_info = {}
-        for table in tables:
-            table_name = table[0]
-            columns = duckdb_conn.execute(f"DESCRIBE {table_name}").fetchall()
-            schema_info[table_name] = [
-                {"name": col[0], "type": col[1]} for col in columns
-            ]
-        
-        return schema_info
-        
-    except Exception as e:
-        logger.error(f"Failed to get table info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    data, hit = cached("dq:status", ttl=10, loader=load)
+    r = JSONResponse(data)
+    r.headers["X-Cache"] = "HIT" if hit else "MISS"
+    r.headers["Cache-Control"] = "public, max-age=10"
+    return r
 
-@app.get("/metrics")
-async def get_current_metrics():
-    """Get current system metrics (non-AI, parquet-only, no NOW())."""
-    try:
-        # Try from gold parquet first
-        latest_kpis = {}
+# static lineage graph + impact traversal
+G_LINEAGE = {
+    "bronze_events": ["silver_events"],
+    "silver_events": ["gold_kpis"],
+    "gold_kpis": ["gold_latest.parquet"],
+    "gold_latest.parquet": ["assistant_api"],
+    "assistant_api": ["frontend_dashboard"],
+}
+
+@app.get("/lineage/graph")
+async def lineage_graph():
+    nodes = [{"id": k, "label": k} for k in G_LINEAGE.keys()]
+    edges = [{"from": u, "to": v} for u, vs in G_LINEAGE.items() for v in vs]
+    return {"nodes": nodes, "edges": edges}
+
+@app.get("/lineage/impact")
+async def lineage_impact(node: str = Query(...)):
+    from collections import deque as _dq
+    q, seen, order = _dq([node]), {node}, []
+    while q:
+        v = q.popleft(); order.append(v)
+        for nxt in G_LINEAGE.get(v, []):
+            if nxt not in seen:
+                seen.add(nxt); q.append(nxt)
+    return {"order": order}
+
+@app.get("/optimize/advice")
+async def optimize_advice():
+    parts = len(glob.glob(GOLD_PARQUET_GLOB))
+    advice = []
+    if parts > 200:
+        advice.append("Consider OPTIMIZE gold_kpis (many small files)")
+    advice.append("Enable AQE; broadcast join small dims (<1e6 rows)")
+    advice.append("ZORDER gold_kpis BY (window_start) if you filter by time")
+    return {"gold_parts": parts, "advice": advice}
+
+@app.get("/alerts/state")
+async def alerts_state(request: Request):
+    ratelimit(request)
+
+    def load():
+        q = f"""
+        SELECT window_start, conversion_rate
+        FROM read_parquet('{GOLD_PARQUET_GLOB}')
+        ORDER BY window_start DESC
+        LIMIT {CONVERSION_ALERT_WINDOW}
+        """
         try:
-            cur = duckdb_conn.execute(
-                f"""
-                SELECT * FROM read_parquet('{GOLD_PARQUET_GLOB}')
-                ORDER BY window_start DESC 
-                LIMIT 1
-                """
-            )
-            row = cur.fetchone()
-            cols = [d[0] for d in cur.description] if cur.description else []
-            latest_kpis = dict(zip(cols, row)) if row else {}
+            rows = duckdb_conn.execute(q).fetchall()
+            breach = bool(rows) and all((r[1] or 0.0) < CONVERSION_ALERT_THRESHOLD for r in rows)
+            return {
+                "breach": breach,
+                "threshold": CONVERSION_ALERT_THRESHOLD,
+                "window_minutes": CONVERSION_ALERT_WINDOW,
+                "samples": [{"window_start": str(r[0]), "conversion_rate": float(r[1] or 0.0)} for r in rows],
+            }
         except Exception:
-            latest_kpis = {}
+            return {"breach": False, "threshold": CONVERSION_ALERT_THRESHOLD, "window_minutes": CONVERSION_ALERT_WINDOW, "samples": []}
 
-        # Fallback: compute latest minute from silver parquet
-        if not latest_kpis:
-            cur = duckdb_conn.execute(
-                f"""
-                WITH silver AS (
-                  SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')
-                ),
-                latest AS (
-                  SELECT date_trunc('minute', CAST(max(ts) AS TIMESTAMP)) AS window_start FROM silver
-                ),
-                windowed AS (
-                  SELECT s.* FROM silver s, latest l
-                  WHERE CAST(s.ts AS TIMESTAMP) >= l.window_start
-                    AND CAST(s.ts AS TIMESTAMP) <  l.window_start + INTERVAL '1 minute'
-                ),
-                agg AS (
-                  SELECT
-                    COUNT(*) FILTER (WHERE event_type='purchase') AS orders,
-                    SUM(COALESCE(price,0)*COALESCE(quantity,0)) FILTER (WHERE event_type='purchase') AS gmv,
-                    COUNT(DISTINCT CASE WHEN event_type='purchase' THEN user_id END) AS purchase_users,
-                    COUNT(DISTINCT CASE WHEN event_type='page_view' THEN user_id END) AS view_users,
-                    COUNT(DISTINCT user_id) AS active_users,
-                    (SELECT window_start FROM latest) AS window_start
-                  FROM windowed
-                )
-                SELECT
-                  window_start,
-                  window_start + INTERVAL '1 minute' AS window_end,
-                  COALESCE(orders,0) AS orders,
-                  COALESCE(gmv,0.0) AS gmv,
-                  COALESCE(purchase_users,0) AS purchase_users,
-                  COALESCE(view_users,0) AS view_users,
-                  COALESCE(active_users,0) AS active_users,
-                  (CASE WHEN COALESCE(view_users,0)=0 THEN 0.0 ELSE purchase_users::DOUBLE / view_users::DOUBLE END) AS conversion_rate
-                FROM agg
-                """
-            )
-            row = cur.fetchone()
-            if row:
-                cols = [d[0] for d in cur.description]
-                latest_kpis = dict(zip(cols, row))
+    data, hit = cached("alerts:conv", ttl=10, loader=load)
+    r = JSONResponse(data)
+    r.headers["X-Cache"] = "HIT" if hit else "MISS"
+    r.headers["Cache-Control"] = "public, max-age=10"
+    return r
 
-        # Recent events over last hour relative to latest timestamp in silver
-        cur2 = duckdb_conn.execute(
-            f"""
-            WITH silver AS (
-              SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')
-            ),
-            latest AS (
-              SELECT max(ts) AS ts_max FROM silver
-            )
-            SELECT event_type, COUNT(*) as count
-            FROM silver s, latest l
-            WHERE CAST(s.ts AS TIMESTAMP) >= date_trunc('minute', CAST(l.ts_max AS TIMESTAMP)) - INTERVAL '1 hour'
-            GROUP BY event_type
-            """
-        )
-        rows2 = cur2.fetchall()
-        recent_events = {row[0]: row[1] for row in rows2} if rows2 else {}
-
-        return {"latest_kpis": latest_kpis, "recent_events": recent_events}
-    except Exception as e:
-        logger.warning(f"Failed to get metrics (likely parquet not ready yet): {e}")
-        return {"latest_kpis": {}, "recent_events": {}}
-
-@app.get("/trend/conversion")
-async def conversion_trend(limit: int = Query(60, ge=1, le=1000)):
-    """Get conversion trend; fallback to silver if gold empty."""
+# -----------------------------------------------------
+# Metrics & SSE
+# -----------------------------------------------------
+async def load_latest_metrics() -> Dict[str, Any]:
+    latest_kpis: Dict[str, Any] = {}
     try:
-        # Gold first
-        try:
-            cur = duckdb_conn.execute(
-                f"""
-                SELECT window_start, conversion_rate
-                FROM read_parquet('{GOLD_PARQUET_GLOB}')
-                ORDER BY window_start DESC
-                LIMIT {int(limit)}
-                """
-            )
-            cols = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchall()
-            res = [dict(zip(cols, r)) for r in rows]
-            if res:
-                return {"results": res}
-        except Exception:
-            pass
-
-        # Fallback from silver history
         cur = duckdb_conn.execute(
             f"""
-            WITH base AS (
-              SELECT date_trunc('minute', CAST(ts AS TIMESTAMP)) AS window_start,
-                     CASE WHEN event_type='purchase' THEN user_id END AS purchase_user,
-                     CASE WHEN event_type='page_view' THEN user_id END AS view_user
-              FROM read_parquet('{SILVER_PARQUET_GLOB}')
-            ),
-            agg AS (
-              SELECT window_start,
-                     COUNT(DISTINCT purchase_user) AS purchase_users,
-                     COUNT(DISTINCT view_user) AS view_users
-              FROM base
-              GROUP BY 1
+            SELECT * FROM read_parquet('{GOLD_PARQUET_GLOB}')
+            ORDER BY window_start DESC LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            cols = [d[0] for d in cur.description]
+            latest_kpis = dict(zip(cols, row))
+    except Exception:
+        pass
+
+    if not latest_kpis:
+        cur = duckdb_conn.execute(
+            f"""
+            WITH silver AS (SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')),
+            latest AS (
+              SELECT date_trunc('minute', CAST(max(ts) AS TIMESTAMP)) AS window_start FROM silver
+            ), windowed AS (
+              SELECT s.* FROM silver s, latest l
+              WHERE CAST(s.ts AS TIMESTAMP) >= l.window_start
+                AND CAST(s.ts AS TIMESTAMP) <  l.window_start + INTERVAL '1 minute'
+            ), agg AS (
+              SELECT
+                COUNT(*) FILTER (WHERE event_type='purchase') AS orders,
+                SUM(COALESCE(price,0)*COALESCE(quantity,0)) FILTER (WHERE event_type='purchase') AS gmv,
+                COUNT(DISTINCT CASE WHEN event_type='purchase' THEN user_id END) AS purchase_users,
+                COUNT(DISTINCT CASE WHEN event_type='page_view' THEN user_id END) AS view_users,
+                COUNT(DISTINCT user_id) AS active_users,
+                (SELECT window_start FROM latest) AS window_start
+              FROM windowed
             )
             SELECT window_start,
-                   CASE WHEN view_users=0 THEN 0.0 ELSE purchase_users::DOUBLE / view_users::DOUBLE END AS conversion_rate
+                   window_start + INTERVAL '1 minute' AS window_end,
+                   COALESCE(orders,0) AS orders,
+                   COALESCE(gmv,0.0) AS gmv,
+                   COALESCE(purchase_users,0) AS purchase_users,
+                   COALESCE(view_users,0) AS view_users,
+                   COALESCE(active_users,0) AS active_users,
+                   (CASE WHEN COALESCE(view_users,0)=0 THEN 0.0 ELSE purchase_users::DOUBLE / view_users::DOUBLE END) AS conversion_rate
             FROM agg
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            cols = [d[0] for d in cur.description]
+            latest_kpis = dict(zip(cols, row))
+
+    cur2 = duckdb_conn.execute(
+        f"""
+        WITH s AS (SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')),
+        l AS (SELECT max(ts) AS ts_max FROM s)
+        SELECT event_type, COUNT(*) AS count
+        FROM s, l
+        WHERE CAST(s.ts AS TIMESTAMP) >= date_trunc('minute', CAST(l.ts_max AS TIMESTAMP)) - INTERVAL '1 hour'
+        GROUP BY event_type
+        """
+    )
+    rows2 = cur2.fetchall()
+    recent_events = {r[0]: r[1] for r in rows2} if rows2 else {}
+    return {"latest_kpis": latest_kpis, "recent_events": recent_events}
+
+@app.get("/sse/metrics")
+async def sse_metrics(request: Request):
+    ratelimit(request)
+
+    async def gen():
+        while True:
+            data = await load_latest_metrics()
+            yield f"data: {json.dumps(data)}\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    ratelimit(request)
+    data = await load_latest_metrics()
+    r = JSONResponse(data)
+    r.headers["Cache-Control"] = "public, max-age=5"
+    return r
+
+# -----------------------------------------------------
+# Trends with time travel
+# -----------------------------------------------------
+
+def parse_as_of(as_of: Optional[str]) -> Optional[str]:
+    if not as_of:
+        return None
+    try:
+        dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
+    except Exception:
+        return None
+
+@app.get("/trend/conversion")
+async def conversion_trend(request: Request, limit: int = Query(60, ge=1, le=1000), as_of: Optional[str] = None):
+    ratelimit(request)
+    as_of_sql = parse_as_of(as_of)
+
+    def load():
+        try:
+            where = f"WHERE window_start <= TIMESTAMP '{as_of_sql}'" if as_of_sql else ""
+            q = f"""
+            SELECT window_start, conversion_rate
+            FROM read_parquet('{GOLD_PARQUET_GLOB}')
+            {where}
             ORDER BY window_start DESC
             LIMIT {int(limit)}
             """
-        )
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall()
-        return {"results": [dict(zip(cols, r)) for r in rows]}
-    except Exception as e:
-        logger.error(f"Conversion trend failed: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/trend/revenue")
-async def revenue_trend(limit: int = Query(60, ge=1, le=1000)):
-    """Get GMV trend; fallback to silver if gold empty."""
-    try:
-        try:
-            cur = duckdb_conn.execute(
-                f"""
-                SELECT window_start, gmv
-                FROM read_parquet('{GOLD_PARQUET_GLOB}')
-                ORDER BY window_start DESC
-                LIMIT {int(limit)}
-                """
-            )
-            cols = [d[0] for d in cur.description] if cur.description else []
+            cur = duckdb_conn.execute(q)
             rows = cur.fetchall()
-            res = [dict(zip(cols, r)) for r in rows]
-            if res:
-                return {"results": res}
+            if rows:
+                cols = [d[0] for d in cur.description]
+                return {"results": [dict(zip(cols, r)) for r in rows]}
         except Exception:
             pass
+        where2 = f"AND CAST(ts AS TIMESTAMP) <= TIMESTAMP '{as_of_sql}'" if as_of_sql else ""
+        q2 = f"""
+        WITH base AS (
+          SELECT date_trunc('minute', CAST(ts AS TIMESTAMP)) AS window_start,
+                 CASE WHEN event_type='purchase' THEN user_id END AS purchase_user,
+                 CASE WHEN event_type='page_view' THEN user_id END AS view_user
+          FROM read_parquet('{SILVER_PARQUET_GLOB}')
+          WHERE 1=1 {where2}
+        ), agg AS (
+          SELECT window_start,
+                 COUNT(DISTINCT purchase_user) AS purchase_users,
+                 COUNT(DISTINCT view_user) AS view_users
+          FROM base GROUP BY 1
+        )
+        SELECT window_start,
+               CASE WHEN view_users=0 THEN 0.0 ELSE purchase_users::DOUBLE / view_users::DOUBLE END AS conversion_rate
+        FROM agg ORDER BY window_start DESC LIMIT {int(limit)}
+        """
+        cur = duckdb_conn.execute(q2)
+        cols = [d[0] for d in cur.description]
+        return {"results": [dict(zip(cols, r)) for r in cur.fetchall()]}
 
-        cur = duckdb_conn.execute(
-            f"""
-            SELECT date_trunc('minute', CAST(ts AS TIMESTAMP)) AS window_start,
-                   SUM(COALESCE(price,0)*COALESCE(quantity,0)) FILTER (WHERE event_type='purchase') AS gmv
-            FROM read_parquet('{SILVER_PARQUET_GLOB}')
-            GROUP BY 1
+    key = f"trend:conv:{limit}:{as_of_sql or 'latest'}"
+    data, hit = cached(key, ttl=10, loader=load)
+    r = JSONResponse(data)
+    r.headers["X-Cache"] = "HIT" if hit else "MISS"
+    r.headers["Cache-Control"] = "public, max-age=10"
+    return r
+
+@app.get("/trend/revenue")
+async def revenue_trend(request: Request, limit: int = Query(60, ge=1, le=1000), as_of: Optional[str] = None):
+    ratelimit(request)
+    as_of_sql = parse_as_of(as_of)
+
+    def load():
+        try:
+            where = f"WHERE window_start <= TIMESTAMP '{as_of_sql}'" if as_of_sql else ""
+            q = f"""
+            SELECT window_start, gmv
+            FROM read_parquet('{GOLD_PARQUET_GLOB}')
+            {where}
             ORDER BY window_start DESC
             LIMIT {int(limit)}
             """
-        )
-        cols = [d[0] for d in cur.description] if cur.description else []
+            cur = duckdb_conn.execute(q)
+            rows = cur.fetchall()
+            if rows:
+                cols = [d[0] for d in cur.description]
+                return {"results": [dict(zip(cols, r)) for r in rows]}
+        except Exception:
+            pass
+        where2 = f"AND CAST(ts AS TIMESTAMP) <= TIMESTAMP '{as_of_sql}'" if as_of_sql else ""
+        q2 = f"""
+        SELECT date_trunc('minute', CAST(ts AS TIMESTAMP)) AS window_start,
+               SUM(COALESCE(price,0)*COALESCE(quantity,0)) FILTER (WHERE event_type='purchase') AS gmv
+        FROM read_parquet('{SILVER_PARQUET_GLOB}')
+        WHERE 1=1 {where2}
+        GROUP BY 1 ORDER BY window_start DESC LIMIT {int(limit)}
+        """
+        cur = duckdb_conn.execute(q2)
+        cols = [d[0] for d in cur.description]
+        return {"results": [dict(zip(cols, r)) for r in cur.fetchall()]}
+
+    key = f"trend:rev:{limit}:{as_of_sql or 'latest'}"
+    data, hit = cached(key, ttl=10, loader=load)
+    r = JSONResponse(data)
+    r.headers["X-Cache"] = "HIT" if hit else "MISS"
+    r.headers["Cache-Control"] = "public, max-age=10"
+    return r
+
+# -----------------------------------------------------
+# Query endpoint with guardrails, EXPLAIN, ETag
+# -----------------------------------------------------
+READ_PARQUET_PATTERN = re.compile(r"read_parquet\(\'([^']+)\'\)", re.IGNORECASE)
+ALLOWED_GLOBS = {SILVER_PARQUET_GLOB, GOLD_PARQUET_GLOB}
+
+
+def validate_sql(sql: str) -> bool:
+    s = sql.lower().strip()
+    if not s.startswith("select"):
+        return False
+    for word in (" drop ", " delete ", " truncate ", " insert ", " update ", " create ", " alter "):
+        if word in f" {s} ":
+            return False
+    for m in READ_PARQUET_PATTERN.finditer(sql):
+        if m.group(1) not in ALLOWED_GLOBS:
+            return False
+    return True
+
+@app.post("/query")
+async def query_data(request: Request, body: Dict[str, Any]):
+    ratelimit(request)
+    question = (body.get("question") or "").lower()
+    include_chart = bool(body.get("include_chart", True))
+
+    # Simple NL→SQL rules (no external deps). Add cases as needed.
+    if "conversion" in question:
+        sql = f"""
+        SELECT window_start, conversion_rate
+        FROM read_parquet('{GOLD_PARQUET_GLOB}')
+        ORDER BY window_start DESC LIMIT 60
+        """.strip()
+        explanation = "Recent conversion rate from gold_kpis"
+    elif "revenue" in question or "gmv" in question:
+        sql = f"""
+        SELECT window_start, gmv
+        FROM read_parquet('{GOLD_PARQUET_GLOB}')
+        ORDER BY window_start DESC LIMIT 60
+        """.strip()
+        explanation = "Recent GMV from gold_kpis"
+    else:
+        sql = f"SELECT COUNT(*) AS total_events FROM read_parquet('{SILVER_PARQUET_GLOB}')"
+        explanation = "Total events from silver"
+
+    if not validate_sql(sql):
+        raise HTTPException(status_code=400, detail="Unsafe or invalid SQL")
+
+    tag = etag_for(sql)
+    if request.headers.get("if-none-match") == tag:
+        return JSONResponse(status_code=304, content={})
+
+    try:
+        plan_rows = duckdb_conn.execute(f"EXPLAIN {sql}").fetchall()
+        plan = "\n".join(str(r[0] if len(r) == 1 else r) for r in plan_rows)
+
+        cur = duckdb_conn.execute(sql)
+        cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
-        return {"results": [dict(zip(cols, r)) for r in rows]}
+        results = [dict(zip(cols, r)) for r in rows]
+
+        chart = None
+        if include_chart and results:
+            names = list(results[0].keys())
+            tcols = [c for c in names if any(k in c.lower() for k in ("time", "date", "window"))]
+            ncols = [c for c in names if isinstance(results[0].get(c), (int, float))]
+            if tcols and ncols:
+                chart = {"type": "line", "x": tcols[0], "y": ncols[0], "title": f"{ncols[0]} over time"}
+
+        payload = {"sql": sql, "results": results, "explanation": explanation, "chart_config": chart, "plan": plan}
+        r = JSONResponse(payload)
+        r.headers["ETag"] = tag
+        r.headers["Cache-Control"] = "public, max-age=5"
+        return r
     except Exception as e:
-        logger.error(f"Revenue trend failed: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("SQL exec failed: %s", e)
+        raise HTTPException(status_code=400, detail=f"SQL execution error: {e}")
+
+# -----------------------------------------------------
+# Simple schema listing (handy for debugging)
+# -----------------------------------------------------
+@app.get("/tables")
+async def list_tables():
+    try:
+        tables = duckdb_conn.execute("SHOW TABLES").fetchall()
+        out = {}
+        for (tname,) in tables:
+            cols = duckdb_conn.execute(f"DESCRIBE {tname}").fetchall()
+            out[tname] = [{"name": c[0], "type": c[1]} for c in cols]
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------
+# Runbook links (surface in UI Help)
+# -----------------------------------------------------
+@app.get("/runbook/links")
+async def runbook_links():
+    return {
+        "start": "./RUNBOOK.md#start",
+        "stop": "./RUNBOOK.md#stop",
+        "backfill": "./RUNBOOK.md#backfill",
+        "replay": "./RUNBOOK.md#replay-from-bronze",
+        "checkpoint": "./RUNBOOK.md#fix-corrupt-checkpoint",
+    }
 
 if __name__ == "__main__":
     try:

@@ -78,6 +78,29 @@ def run_bronze_pipeline(spark):
     
     return query
 
+def wait_for_delta_table(spark, table_path, max_wait_minutes=10):
+    """Wait for a Delta table to exist and have data"""
+    logger.info(f"Waiting for Delta table at {table_path}...")
+    
+    for i in range(max_wait_minutes * 12):  # Check every 5 seconds
+        try:
+            # Try to read the table
+            df = spark.read.format("delta").load(table_path)
+            count = df.count()
+            if count > 0:
+                logger.info(f"Delta table {table_path} is ready with {count} records")
+                return True
+            else:
+                logger.info(f"Delta table {table_path} exists but is empty, waiting...")
+        except Exception as e:
+            if i == 0:
+                logger.info(f"Delta table {table_path} doesn't exist yet, waiting...")
+        
+        time.sleep(5)
+    
+    logger.warning(f"Delta table {table_path} still not ready after {max_wait_minutes} minutes")
+    return False
+
 def run_silver_pipeline(spark):
     """Silver: parse, validate, dedupe"""
     logger.info("Starting Silver pipeline...")
@@ -85,6 +108,10 @@ def run_silver_pipeline(spark):
     bronze_path = f"{DELTA_PATH}/bronze_events"
     silver_path = f"{DELTA_PATH}/silver_events"
     checkpoint_path = f"/checkpoints/silver"
+    
+    # Wait for bronze table to have data
+    if not wait_for_delta_table(spark, bronze_path):
+        raise Exception("Bronze table not ready, cannot start silver pipeline")
     
     # Read from Bronze Delta table
     bronze = spark.readStream.format("delta").load(bronze_path)
@@ -125,8 +152,15 @@ def run_gold_pipeline(spark):
     gold_path = f"{DELTA_PATH}/gold_kpis"
     checkpoint_path = f"/checkpoints/gold"
     
+    # Wait for silver table to have data
+    if not wait_for_delta_table(spark, silver_path):
+        raise Exception("Silver table not ready, cannot start gold pipeline")
+    
     # Read from Silver
-    events = spark.readStream.format("delta").load(silver_path).withWatermark("ts", "15 minutes")
+    events = (spark.readStream
+              .format("delta")
+              .load(silver_path)
+              .withWatermark("ts", "30 seconds"))
     
     # 1-minute windows
     win = F.window("ts", "1 minute")
@@ -164,7 +198,8 @@ def run_gold_pipeline(spark):
     query = (gold.writeStream
         .format("delta")
         .option("checkpointLocation", checkpoint_path)
-        .outputMode("append")
+        .outputMode("complete")
+        .trigger(processingTime="10 seconds")
         .option("path", gold_path)
         .start())
     

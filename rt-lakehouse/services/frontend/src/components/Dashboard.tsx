@@ -55,6 +55,10 @@ const Dashboard: React.FC = () => {
   const [loadingQuery, setLoadingQuery] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // New: trend states
+  const [conversionTrend, setConversionTrend] = useState<Array<Record<string, any>>>([]);
+  const [revenueTrend, setRevenueTrend] = useState<Array<Record<string, any>>>([]);
+
   // Poll metrics every 5s
   useEffect(() => {
     let mounted = true;
@@ -106,11 +110,43 @@ const Dashboard: React.FC = () => {
     return Object.entries(metrics.recent_events).map(([name, count]) => ({ name, count }));
   }, [metrics]);
 
-  // Prepare conversion trend data from query results if present
-  const trendData = useMemo(() => {
-    if (!queryData?.results || queryData.results.length === 0) return [] as Array<Record<string, any>>;
-    return [...queryData.results].reverse(); // chronological order if API returned DESC
-  }, [queryData]);
+  // New: fetch non-AI conversion & revenue trends every 10s
+  useEffect(() => {
+    let mounted = true;
+    const fetchTrends = async () => {
+      try {
+        const [cRes, rRes] = await Promise.all([
+          fetch(`${API_URL}/trend/conversion?limit=60`),
+          fetch(`${API_URL}/trend/revenue?limit=60`),
+        ]);
+        if (cRes.ok) {
+          const cData = await cRes.json();
+          if (mounted) setConversionTrend(Array.isArray(cData?.results) ? cData.results : []);
+        }
+        if (rRes.ok) {
+          const rData = await rRes.json();
+          if (mounted) setRevenueTrend(Array.isArray(rData?.results) ? rData.results : []);
+        }
+      } catch (_) {
+        // ignore
+      }
+    };
+    fetchTrends();
+    const id = setInterval(fetchTrends, 10000);
+    return () => { mounted = false; clearInterval(id); };
+  }, []);
+
+  // Prepare conversion trend data for chart: prefer query results, fallback to non-AI trend
+  const conversionSeries = useMemo(() => {
+    const arr = (queryData?.results?.length ? queryData.results : conversionTrend) || [];
+    return [...arr].reverse(); // chronological
+  }, [queryData, conversionTrend]);
+
+  // Prepare revenue trend
+  const revenueSeries = useMemo(() => {
+    const arr = revenueTrend || [];
+    return [...arr].reverse();
+  }, [revenueTrend]);
 
   return (
     <div style={{ padding: 20, fontFamily: 'Inter, system-ui, Arial, sans-serif', background: '#f6f7f9', minHeight: '100vh' }}>
@@ -168,15 +204,45 @@ const Dashboard: React.FC = () => {
         <div style={cardStyle}>
           <div style={sectionTitle}>Conversion Rate Trend</div>
           <div style={{ height: 260 }}>
-            <ResponsiveContainer>
-              <LineChart data={trendData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey={(queryData?.chart_config?.x) || 'window_start'} tickFormatter={(v) => String(v).slice(11, 19)} />
-                <YAxis domain={[0, 'auto']} />
-                <Tooltip />
-                <Line type="monotone" dataKey={(queryData?.chart_config?.y) || 'conversion_rate'} stroke="#10b981" dot={false} name="Conversion" />
-              </LineChart>
-            </ResponsiveContainer>
+            {conversionSeries.length === 0 ? (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#6b7280' }}>
+                No conversion rate data available
+              </div>
+            ) : (
+              <ResponsiveContainer>
+                <LineChart data={conversionSeries}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey={(queryData?.chart_config?.x) || 'window_start'} tickFormatter={(v) => String(v).slice(11, 19)} />
+                  <YAxis domain={[0, 'auto']} />
+                  <Tooltip />
+                  <Line type="monotone" dataKey={(queryData?.chart_config?.y) || 'conversion_rate'} stroke="#10b981" dot={false} name="Conversion" />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Revenue Trend Row */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12, marginBottom: 16 }}>
+        <div style={cardStyle}>
+          <div style={sectionTitle}>Revenue Trend</div>
+          <div style={{ height: 260 }}>
+            {revenueSeries.length === 0 ? (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#6b7280' }}>
+                No revenue data available
+              </div>
+            ) : (
+              <ResponsiveContainer>
+                <LineChart data={revenueSeries}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="window_start" tickFormatter={(v) => String(v).slice(11, 19)} />
+                  <YAxis domain={[0, 'auto']} />
+                  <Tooltip />
+                  <Line type="monotone" dataKey="gmv" stroke="#6366f1" dot={false} name="GMV" />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </div>
       </div>

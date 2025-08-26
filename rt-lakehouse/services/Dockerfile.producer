@@ -2,6 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Ensure Python stdout/stderr are unbuffered so logs appear immediately
+ENV PYTHONUNBUFFERED=1
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
@@ -15,5 +18,5 @@ RUN pip install --no-cache-dir -r requirements-producer.txt
 COPY producers/kafka_event_producer.py ./kafka_event_producer.py
 COPY pipelines/00_config.py ./config.py
 
-# Run producer
-CMD ["python", "kafka_event_producer.py"]
+# Run producer (unbuffered)
+CMD ["python3", "-u", "kafka_event_producer.py"]

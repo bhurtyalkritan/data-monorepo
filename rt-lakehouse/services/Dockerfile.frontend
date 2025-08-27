@@ -3,13 +3,13 @@ FROM node:18-alpine
 WORKDIR /app
 
 # Copy package files from the frontend directory
-COPY services/frontend/package.json ./
+COPY rt-lakehouse/services/frontend/package.json ./
 
 # Install all dependencies (including dev dependencies needed for build)
 RUN npm install
 
 # Copy frontend code
-COPY services/frontend/ ./
+COPY rt-lakehouse/services/frontend/ ./
 
 # Build the app
 RUN npm run build

@@ -1,7 +1,10 @@
-import json, random, time, uuid, os
+import json
+import random
+import time
+import uuid
+import os
 from datetime import datetime, timezone, timedelta
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "ecommerce_events")
@@ -15,25 +18,25 @@ MAX_OUT_OF_ORDER_SEC = int(os.getenv("MAX_OUT_OF_ORDER_SEC", "900"))     # late 
 SKEW_TOP_USERS = int(os.getenv("SKEW_TOP_USERS", "50"))                  # top N users to concentrate traffic on
 SKEW_USER_RATIO = float(os.getenv("SKEW_USER_RATIO", "0.6"))            # probability an event belongs to a top user
 KEY_FIELD = os.getenv("KEY_FIELD", "user_id")                             # kafka message key: user_id|event_id|country|none
-INCLUDE_HEADERS = os.getenv("INCLUDE_HEADERS", "1").lower() in ("1","true","yes")
+INCLUDE_HEADERS = os.getenv("INCLUDE_HEADERS", "1").lower() in ("1", "true", "yes")
 BURST_EVERY_SEC = int(os.getenv("BURST_EVERY_SEC", "0"))                 # 0 disables bursts; otherwise burst periodically
 BURST_MULTIPLIER = float(os.getenv("BURST_MULTIPLIER", "3.0"))           # multiply EPS during burst window
 BURST_DURATION_SEC = int(os.getenv("BURST_DURATION_SEC", "5"))           # duration of each burst
 
 # Reference data
 products = [f"p-{i}" for i in range(1000)]
-users    = [f"u-{i}" for i in range(20000)]
+users = [f"u-{i}" for i in range(20000)]
 
 # Top users for skew
 _top_users = users[:max(1, min(SKEW_TOP_USERS, len(users)))]
 
-countries= ["US","CA","GB","DE","IN","BR","AU"]
-devices  = ["mobile","desktop","tablet"]
-campaigns= ["spring_sale","black_friday","new_user", None, None]
-referrers= ["direct","google","facebook","twitter","newsletter"]
+countries = ["US", "CA", "GB", "DE", "IN", "BR", "AU"]
+devices = ["mobile", "desktop", "tablet"]
+campaigns = ["spring_sale", "black_friday", "new_user", None, None]
+referrers = ["direct", "google", "facebook", "twitter", "newsletter"]
 
 # Multi-currency support (simple static FX map)
-currencies = ["USD","EUR","GBP","INR","BRL","AUD","CAD"]
+currencies = ["USD", "EUR", "GBP", "INR", "BRL", "AUD", "CAD"]
 fx = {
     "USD": 1.0, "EUR": 0.92, "GBP": 0.78, "INR": 83.0, "BRL": 5.1, "AUD": 1.5, "CAD": 1.35
 }
@@ -63,8 +66,8 @@ def _maybe_bad_event(evt: dict) -> dict:
     if random.random() >= BAD_EVENT_RATIO:
         return evt
     # Inject one of several data quality issues
-    choice = random.choice(["null_price","neg_price","missing_user","bad_event_type","qty_string","empty_product"]) 
-    if choice == "null_price" and evt["event_type"] in ("add_to_cart","purchase"):
+    choice = random.choice(["null_price", "neg_price", "missing_user", "bad_event_type", "qty_string", "empty_product"])
+    if choice == "null_price" and evt["event_type"] in ("add_to_cart", "purchase"):
         evt["price"] = None
     elif choice == "neg_price" and evt["event_type"] == "purchase":
         evt["price"] = -abs(evt.get("price") or 0)
@@ -80,16 +83,16 @@ def _maybe_bad_event(evt: dict) -> dict:
 
 
 def make_event():
-    et = random.choices(["page_view","add_to_cart","purchase"], [0.86,0.11,0.03])[0]
-    base_price_usd = round(random.uniform(5,200),2)
-    qty = 1 if et != "purchase" else random.choice([1,1,1,2,3])
+    et = random.choices(["page_view", "add_to_cart", "purchase"], [0.86, 0.11, 0.03])[0]
+    base_price_usd = round(random.uniform(5, 200), 2)
+    qty = 1 if et != "purchase" else random.choice([1, 1, 1, 2, 3])
     country = random.choice(countries)
-    cur = random.choice(currencies) if et in ("add_to_cart","purchase") else "USD"
+    cur = random.choice(currencies) if et in ("add_to_cart", "purchase") else "USD"
     # Convert to selected currency (roughly)
-    price = base_price_usd if cur == "USD" else round(base_price_usd * fx.get(cur,1.0), 2)
+    price = base_price_usd if cur == "USD" else round(base_price_usd * fx.get(cur, 1.0), 2)
 
     user_id = _choose_user()
-    session_id = f"s-{user_id}-{random.randint(1,10000)}"
+    session_id = f"s-{user_id}-{random.randint(1, 10000)}"
     device = random.choice(devices)
 
     ts_dt = _maybe_late(datetime.now(timezone.utc))
@@ -99,7 +102,7 @@ def make_event():
         "user_id": user_id,
         "product_id": random.choice(products),
         "event_type": et,
-        "price": price if et in ("add_to_cart","purchase") else None,
+        "price": price if et in ("add_to_cart", "purchase") else None,
         "quantity": qty if et == "purchase" else None,
         "currency": cur,
         "ts": ts_dt.isoformat(),
@@ -117,13 +120,13 @@ def make_event():
     # Track for potential duplicates
     _recent_events.append(evt)
     if len(_recent_events) > _RECENT_MAX:
-        del _recent_events[0:len(_recent_events)-_RECENT_MAX]
+        del _recent_events[0:len(_recent_events) - _RECENT_MAX]
 
     return evt
 
 
 def _choose_key(evt: dict):
-    if KEY_FIELD.lower() in ("none","", "null"):
+    if KEY_FIELD.lower() in ("none", "", "null"):
         return None
     key_val = evt.get(KEY_FIELD) or ""
     try:

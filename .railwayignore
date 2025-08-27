@@ -1,0 +1,61 @@
+# Railway ignore file - Only upload RT-Lakehouse essentials
+# This prevents the entire monorepo from being uploaded (15MB limit)
+
+# Ignore everything by default
+*
+
+# Include only RT-Lakehouse essentials
+!rt-lakehouse/
+
+# Essential files at root level
+!rt-lakehouse/*.py
+!rt-lakehouse/*.txt
+!rt-lakehouse/*.yml
+!rt-lakehouse/*.yaml
+!rt-lakehouse/Dockerfile.railway
+!rt-lakehouse/Caddyfile
+
+# Essential directories
+!rt-lakehouse/services/
+!rt-lakehouse/pipelines/
+!rt-lakehouse/sql/
+!rt-lakehouse/producers/
+
+# Within services, include everything except heavy files
+rt-lakehouse/services/frontend/node_modules/
+rt-lakehouse/services/frontend/package-lock.json
+
+# Within rt-lakehouse, ignore heavy/unnecessary directories
+rt-lakehouse/data/
+rt-lakehouse/docs/
+rt-lakehouse/notebooks/
+rt-lakehouse/tests/
+rt-lakehouse/scripts/
+
+# Ignore large documentation files
+rt-lakehouse/CASE_STUDY.md
+rt-lakehouse/TECHNICAL_DEEP_DIVE.md
+rt-lakehouse/PRESENTATION_STRUCTURE.md
+rt-lakehouse/LAUNCH_STRATEGY.md
+rt-lakehouse/OPEN_SOURCE_ROADMAP.md
+
+# Ignore development/test files
+rt-lakehouse/.env*
+rt-lakehouse/performance_*
+rt-lakehouse/locustfile.py
+rt-lakehouse/test_*.py
+rt-lakehouse/docker-compose.test.yml
+rt-lakehouse/docker-compose.production.yml
+rt-lakehouse/deploy-railway.sh
+rt-lakehouse/start.sh
+
+# Ignore Python artifacts
+rt-lakehouse/**/*.pyc
+rt-lakehouse/**/__pycache__/
+rt-lakehouse/**/.pytest_cache/
+rt-lakehouse/**/coverage.xml
+rt-lakehouse/**/.coverage
+
+# Include Railway configuration at monorepo root
+!railway.json
+!railway.toml

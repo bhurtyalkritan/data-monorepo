@@ -1,0 +1,19 @@
+[flake8]
+max-line-length = 100
+ignore = 
+    E501,  # line too long
+    W503,  # line break before binary operator
+    F403,  # star imports (needed for PySpark)
+    F405   # undefined names from star imports
+exclude = 
+    .git,
+    __pycache__,
+    .pytest_cache,
+    .venv,
+    venv,
+    data/,
+    .github/
+per-file-ignores =
+    pipelines/*.py:F403,F405,E402
+    tests/test_dedupe.py:F401
+    services/time_travel_manager.py:W293

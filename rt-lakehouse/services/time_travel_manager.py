@@ -306,42 +306,44 @@ def main():
     vacuum_parser.add_argument("--retention-hours", type=int, help="Retention period in hours")
     vacuum_parser.add_argument("--dry-run", action="store_true", default=True, help="Show what would be deleted")
     vacuum_parser.add_argument("--execute", action="store_true", help="Actually perform vacuum")
-    
+
     # Snapshot command
     snapshot_parser = subparsers.add_parser("snapshot", help="Create table snapshot")
     snapshot_parser.add_argument("--table", required=True, choices=["bronze", "silver", "gold"])
     snapshot_parser.add_argument("--description", default="Manual snapshot", help="Snapshot description")
-    
+
     args = parser.parse_args()
-    
+
     if not args.command:
         parser.print_help()
         return
-    
+
     # Create Spark session
     print("Initializing Spark session...")
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
-    
+
     try:
         if args.command == "history":
             show_history(spark, args.table, args.limit)
-            
+
         elif args.command == "read":
-            read_at_version(spark, args.table, args.version, args.timestamp, args.limit, args.schema)
-            
+            read_at_version(spark, args.table, args.version,
+                          args.timestamp, args.limit, args.schema)
+
         elif args.command == "compare":
             compare_versions(spark, args.table, args.version1, args.version2)
-            
+
         elif args.command == "vacuum":
             dry_run = not args.execute
             vacuum_table(spark, args.table, args.retention_hours, dry_run)
-            
+
         elif args.command == "snapshot":
             create_snapshot(spark, args.table, args.description)
-            
+
     finally:
         spark.stop()
+
 
 if __name__ == "__main__":
     main()

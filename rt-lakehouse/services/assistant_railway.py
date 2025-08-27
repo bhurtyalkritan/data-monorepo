@@ -82,7 +82,7 @@ app = FastAPI(
 cors_origins = os.getenv("CORS_ORIGINS", '["*"]')
 try:
     origins = json.loads(cors_origins)
-except:
+except Exception:
     origins = ["*"]
 
 app.add_middleware(

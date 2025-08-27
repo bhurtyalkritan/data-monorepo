@@ -670,6 +670,7 @@ async def query_data(request: Request, body: Dict[str, Any]):
     try:
         # Use plain EXPLAIN and format rows for compatibility
         plan_rows = duckdb_conn.execute(f"EXPLAIN {sql}").fetchall()
+
         def _row_to_text(r):
             if isinstance(r, (list, tuple)):
                 if len(r) > 1 and isinstance(r[1], str):
@@ -677,6 +678,7 @@ async def query_data(request: Request, body: Dict[str, Any]):
                 if len(r) == 1:
                     return str(r[0])
             return str(r)
+
         plan_txt = "\n".join(_row_to_text(r) for r in plan_rows)
 
         cur = duckdb_conn.execute(sql)

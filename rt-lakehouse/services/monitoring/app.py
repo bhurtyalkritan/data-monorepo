@@ -207,7 +207,7 @@ def main():
                 latest_time = pd.to_datetime(latest_event.iloc[0, 0])
                 freshness = datetime.now() - latest_time
                 st.metric("Data Freshness", f"{freshness.seconds}s ago")
-            except:
+            except Exception:
                 st.metric("Data Freshness", "N/A")
         else:
             st.metric("Data Freshness", "N/A")

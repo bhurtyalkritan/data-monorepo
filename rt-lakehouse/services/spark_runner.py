@@ -216,7 +216,7 @@ def run_gold_pipeline(spark):
                 F.col("purchase_users"),
                 F.col("view_users"),
                 F.col("active_users"),
-                (F.col("purchase_users").cast("double") / 
+                (F.col("purchase_users").cast("double") /
                  F.when(F.col("view_users") == 0, F.lit(1)).otherwise(F.col("view_users"))).alias("conversion_rate")
             ))
 
@@ -440,6 +440,7 @@ def main():
         # Optional: background incremental MERGE job (disabled by default)
         if ENABLE_GOLD_MERGE_BACKFILL:
             import threading
+
             def _merge_loop():
                 while True:
                     try:
@@ -447,6 +448,7 @@ def main():
                     except Exception as e:
                         logger.error(f"Merge loop error: {e}")
                     time.sleep(max(30, MERGE_INTERVAL_SEC))
+
             threading.Thread(target=_merge_loop, daemon=True).start()
         
         # Setup DuckDB integration (periodic)

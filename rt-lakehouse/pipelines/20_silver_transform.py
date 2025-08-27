@@ -28,5 +28,6 @@ deduped = (clean
 (deduped.writeStream
   .format("delta")
   .option("checkpointLocation", silver_chkpt)
+  .option("mergeSchema", "true")
   .outputMode("append")
   .table(silver_tbl))

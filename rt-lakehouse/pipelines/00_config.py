@@ -27,5 +27,10 @@ event_schema = StructType([
   StructField("currency", StringType()),
   StructField("ts", TimestampType()),
   StructField("ua", StringType()),
-  StructField("country", StringType())
+  StructField("country", StringType()),
+  # New optional attributes from the producer
+  StructField("session_id", StringType()),
+  StructField("device", StringType()),
+  StructField("campaign", StringType()),
+  StructField("referrer", StringType()),
 ])

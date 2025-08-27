@@ -33,10 +33,13 @@ CONVERSION_ALERT_WINDOW = int(os.getenv("CONVERSION_ALERT_WINDOW", "5"))  # last
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "60"))   # requests per window
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60")) # seconds
 
+TENANT_ENFORCE = os.getenv("TENANT_ENFORCE", "false").lower() in ("1", "true", "yes")
+TENANT_COLUMN = os.getenv("TENANT_COLUMN", "tenant_id")
+
 # -----------------------------------------------------
 # App & CORS
 # -----------------------------------------------------
-app = FastAPI(title="RT-Lakehouse Assistant API", version="2.0.0")
+app = FastAPI(title="RT-Lakehouse Assistant API", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -150,6 +153,8 @@ async def healthz():
         "uptime_sec": int(time.time() - _start_time),
         "cache_stats": _cache_stats,
         "rate_limit": {"limit": RATE_LIMIT, "window": RATE_WINDOW},
+        "tenant_enforce": TENANT_ENFORCE,
+        "tenant_column": TENANT_COLUMN,
     }
 
 # -----------------------------------------------------
@@ -210,6 +215,14 @@ async def lineage_impact(node: str = Query(...)):
             if nxt not in seen:
                 seen.add(nxt); q.append(nxt)
     return {"order": order}
+
+@app.get("/lineage/whatif")
+async def lineage_whatif(node: str = Query(...)):
+    # Impacted downstream nodes
+    order = (await lineage_impact(node))  # type: ignore
+    impacted = [n for n in order.get("order", []) if n != node]
+    recommendation = f"If {node} is delayed, refresh downstream tables: {', '.join(impacted) or 'none'}. Consider backfill or re-run the pipeline."
+    return {"node": node, "impacted": impacted, "recommendation": recommendation}
 
 @app.get("/optimize/advice")
 async def optimize_advice():
@@ -347,8 +360,9 @@ def parse_as_of(as_of: Optional[str]) -> Optional[str]:
     if not as_of:
         return None
     try:
+        # Parse to naive timestamp string to avoid tz type mismatch
         dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
@@ -397,10 +411,10 @@ async def conversion_trend(request: Request, limit: int = Query(60, ge=1, le=100
         return {"results": [dict(zip(cols, r)) for r in cur.fetchall()]}
 
     key = f"trend:conv:{limit}:{as_of_sql or 'latest'}"
-    data, hit = cached(key, ttl=10, loader=load)
+    data, hit = cached(key, ttl=5, loader=load)
     r = JSONResponse(data)
     r.headers["X-Cache"] = "HIT" if hit else "MISS"
-    r.headers["Cache-Control"] = "public, max-age=10"
+    r.headers["Cache-Control"] = "no-store"
     return r
 
 @app.get("/trend/revenue")
@@ -438,11 +452,112 @@ async def revenue_trend(request: Request, limit: int = Query(60, ge=1, le=1000),
         return {"results": [dict(zip(cols, r)) for r in cur.fetchall()]}
 
     key = f"trend:rev:{limit}:{as_of_sql or 'latest'}"
-    data, hit = cached(key, ttl=10, loader=load)
+    data, hit = cached(key, ttl=5, loader=load)
     r = JSONResponse(data)
     r.headers["X-Cache"] = "HIT" if hit else "MISS"
-    r.headers["Cache-Control"] = "public, max-age=10"
+    r.headers["Cache-Control"] = "no-store"
     return r
+
+# -----------------------------------------------------
+# Latency, Skew, Forecast, Anomaly, ML Features
+# -----------------------------------------------------
+@app.get("/latency")
+async def latency():
+    try:
+        s_max = duckdb_conn.execute(
+            f"SELECT max(CAST(ts AS TIMESTAMP)) FROM read_parquet('{SILVER_PARQUET_GLOB}')"
+        ).fetchone()[0]
+    except Exception:
+        s_max = None
+    try:
+        g_max = duckdb_conn.execute(
+            f"SELECT max(window_start) FROM read_parquet('{GOLD_PARQUET_GLOB}')"
+        ).fetchone()[0]
+    except Exception:
+        g_max = None
+    lag_sec = None
+    if s_max and g_max:
+        # DuckDB returns Python datetime; compute seconds
+        lag_sec = max(0.0, (s_max - g_max).total_seconds())
+    return {"silver_latest": str(s_max) if s_max else None, "gold_latest": str(g_max) if g_max else None, "lag_sec": lag_sec}
+
+@app.get("/skew/check")
+async def skew_check(key: str = Query("user_id"), topk: int = Query(12, ge=1, le=1000)):
+    try:
+        q = f"""
+        WITH s AS (SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')),
+        l AS (SELECT max(ts) AS ts_max FROM s)
+        SELECT {key} AS key, COUNT(*) AS freq
+        FROM s, l
+        WHERE CAST(s.ts AS TIMESTAMP) >= date_trunc('minute', CAST(l.ts_max AS TIMESTAMP)) - INTERVAL '1 hour'
+        GROUP BY 1 ORDER BY freq DESC NULLS LAST LIMIT {int(topk)}
+        """
+        cur = duckdb_conn.execute(q)
+        rows = cur.fetchall()
+        return {"key": key, "top": [{"key": r[0], "freq": r[1]} for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/forecast/conversion")
+async def forecast_conversion(limit: int = Query(120, ge=10, le=2000), horizon: int = Query(12, ge=1, le=2000), ma_window: int = Query(7, ge=1, le=200)):
+    # Pull recent series
+    cur = duckdb_conn.execute(
+        f"SELECT conversion_rate FROM read_parquet('{GOLD_PARQUET_GLOB}') ORDER BY window_start DESC LIMIT {int(limit)}"
+    )
+    vals = [float(r[0]) for r in cur.fetchall()][::-1]
+    if not vals:
+        return {"history": [], "history_smoothed": [], "forecast": [], "horizon": horizon}
+    # Simple moving average smoothing
+    smoothed: List[float] = []
+    for i in range(len(vals)):
+        s = max(0, i - ma_window + 1)
+        window = vals[s:i+1]
+        smoothed.append(sum(window) / len(window))
+    # Naive forecast: repeat last smoothed value
+    last = smoothed[-1]
+    forecast = [last for _ in range(horizon)]
+    return {"history": vals, "history_smoothed": smoothed, "forecast": forecast, "horizon": horizon}
+
+@app.get("/anomaly/conversion")
+async def anomaly_conversion(limit: int = Query(120, ge=10, le=5000), z: float = Query(2.0, ge=0.1, le=10.0)):
+    cur = duckdb_conn.execute(
+        f"SELECT window_start, conversion_rate FROM read_parquet('{GOLD_PARQUET_GLOB}') ORDER BY window_start DESC LIMIT {int(limit)}"
+    )
+    rows = cur.fetchall()[::-1]
+    rates = [float(r[1] or 0.0) for r in rows]
+    if not rates:
+        return {"mean": 0.0, "std": 0.0, "z": z, "anomalies": []}
+    mu = sum(rates) / len(rates)
+    var = sum((x - mu) ** 2 for x in rates) / max(1, (len(rates) - 1))
+    sd = var ** 0.5
+    anomalies = []
+    if sd > 0:
+        for i, (ts, rate) in enumerate(rows):
+            zz = abs(((rate or 0.0) - mu) / sd)
+            if zz >= z:
+                anomalies.append({"window_start": str(ts), "rate": float(rate or 0.0), "z": zz})
+    return {"mean": mu, "std": sd, "z": z, "anomalies": anomalies}
+
+@app.get("/ml/features")
+async def ml_features(limit: int = Query(20, ge=1, le=1000)):
+    q = f"""
+    WITH s AS (
+      SELECT * FROM read_parquet('{SILVER_PARQUET_GLOB}')
+    ), agg AS (
+      SELECT user_id,
+             SUM(CASE WHEN event_type='purchase' THEN COALESCE(price,0)*COALESCE(quantity,0) ELSE 0 END) AS total_spend,
+             SUM(CASE WHEN event_type='purchase' THEN 1 ELSE 0 END) AS purchase_count,
+             SUM(CASE WHEN event_type='page_view' THEN 1 ELSE 0 END) AS views
+      FROM s
+      GROUP BY user_id
+    )
+    SELECT user_id, purchase_count, total_spend, views
+    FROM agg ORDER BY total_spend DESC NULLS LAST LIMIT {int(limit)}
+    """
+    cur = duckdb_conn.execute(q)
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"features": rows}
 
 # -----------------------------------------------------
 # Query endpoint with guardrails, EXPLAIN, ETag
@@ -496,8 +611,16 @@ async def query_data(request: Request, body: Dict[str, Any]):
         return JSONResponse(status_code=304, content={})
 
     try:
+        # Use plain EXPLAIN and format rows for compatibility
         plan_rows = duckdb_conn.execute(f"EXPLAIN {sql}").fetchall()
-        plan = "\n".join(str(r[0] if len(r) == 1 else r) for r in plan_rows)
+        def _row_to_text(r):
+            if isinstance(r, (list, tuple)):
+                if len(r) > 1 and isinstance(r[1], str):
+                    return r[1]
+                if len(r) == 1:
+                    return str(r[0])
+            return str(r)
+        plan_txt = "\n".join(_row_to_text(r) for r in plan_rows)
 
         cur = duckdb_conn.execute(sql)
         cols = [d[0] for d in cur.description]
@@ -512,7 +635,7 @@ async def query_data(request: Request, body: Dict[str, Any]):
             if tcols and ncols:
                 chart = {"type": "line", "x": tcols[0], "y": ncols[0], "title": f"{ncols[0]} over time"}
 
-        payload = {"sql": sql, "results": results, "explanation": explanation, "chart_config": chart, "plan": plan}
+        payload = {"sql": sql, "results": results, "explanation": explanation, "chart_config": chart, "plan": plan_txt}
         r = JSONResponse(payload)
         r.headers["ETag"] = tag
         r.headers["Cache-Control"] = "public, max-age=5"
@@ -520,6 +643,62 @@ async def query_data(request: Request, body: Dict[str, Any]):
     except Exception as e:
         logger.error("SQL exec failed: %s", e)
         raise HTTPException(status_code=400, detail=f"SQL execution error: {e}")
+
+# -----------------------------------------------------
+# SQL analysis & backfill
+# -----------------------------------------------------
+@app.post("/analyze/sql")
+async def analyze_sql(body: Dict[str, Any]):
+    sql = (body.get("sql") or "").strip()
+    if not sql:
+        raise HTTPException(status_code=400, detail="sql is required")
+    if not validate_sql(sql):
+        raise HTTPException(status_code=400, detail="Unsafe or invalid SQL")
+    try:
+        def _rows_to_text(rows):
+            out = []
+            for r in rows:
+                if isinstance(r, (list, tuple)) and len(r) > 1 and isinstance(r[1], str):
+                    out.append(r[1])
+                elif isinstance(r, (list, tuple)) and len(r) == 1:
+                    out.append(str(r[0]))
+                else:
+                    out.append(str(r))
+            return "\n".join(out)
+        explain = _rows_to_text(duckdb_conn.execute(f"EXPLAIN {sql}").fetchall())
+        count_plan = _rows_to_text(duckdb_conn.execute(f"EXPLAIN SELECT COUNT(*) FROM ({sql}) t").fetchall())
+        return {
+            "sql": sql,
+            "explain": explain.splitlines(),
+            "count_estimate_plan": count_plan.splitlines(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/backfill/gold")
+async def backfill_gold():
+    # Materialize gold_kpis parquet view into a DuckDB table for faster reads
+    try:
+        # Create or replace table from parquet view
+        duckdb_conn.execute("CREATE OR REPLACE TABLE gold_kpis_tbl AS SELECT * FROM read_parquet(?)", [GOLD_PARQUET_GLOB])
+        cnt = duckdb_conn.execute("SELECT COUNT(*) FROM gold_kpis_tbl").fetchone()[0]
+        return {"materialized_rows": int(cnt), "table": "gold_kpis_tbl"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------
+# Security / whoami
+# -----------------------------------------------------
+@app.get("/security/whoami")
+async def security_whoami(request: Request):
+    # Demo: infer tenant from header or env
+    tenant = request.headers.get("x-tenant") or os.getenv("TENANT", None)
+    return {
+        "tenant": tenant,
+        "tenant_enforce": TENANT_ENFORCE,
+        "jwt_enabled": False,
+        "tenant_column": TENANT_COLUMN,
+    }
 
 # -----------------------------------------------------
 # Simple schema listing (handy for debugging)

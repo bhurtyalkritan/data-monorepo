@@ -12,13 +12,15 @@ raw_stream = (spark.readStream
     .option("subscribe", kafka_topic)
     .option("startingOffsets", "latest")
     .option("failOnDataLoss", "false")
+    .option("includeHeaders", "true")
     .load())
 
 bronze = (raw_stream
     .select(
         F.col("value").cast("string").alias("raw_json"),
         F.col("timestamp").alias("kafka_ts"),
-        F.col("topic"), F.col("partition"), F.col("offset")
+        F.col("topic"), F.col("partition"), F.col("offset"),
+        F.col("headers").alias("headers")
     ))
 
 (bronze.writeStream

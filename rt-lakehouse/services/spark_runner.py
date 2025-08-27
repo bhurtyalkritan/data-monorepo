@@ -22,7 +22,7 @@ GOLD_WATERMARK = os.getenv("GOLD_WATERMARK", "30 seconds")
 ENABLE_GOLD_MERGE_BACKFILL = os.getenv("ENABLE_GOLD_MERGE_BACKFILL", "0").lower() in ("1","true","yes")
 MERGE_INTERVAL_SEC = int(os.getenv("MERGE_INTERVAL_SEC", "120"))
 
-# Event schema
+# Event schema (updated with new attributes)
 event_schema = StructType([
     StructField("event_id", StringType()),
     StructField("user_id", StringType()),
@@ -33,7 +33,12 @@ event_schema = StructType([
     StructField("currency", StringType()),
     StructField("ts", TimestampType()),
     StructField("ua", StringType()),
-    StructField("country", StringType())
+    StructField("country", StringType()),
+    # New optional attributes from producer
+    StructField("session_id", StringType()),
+    StructField("device", StringType()),
+    StructField("campaign", StringType()),
+    StructField("referrer", StringType()),
 ])
 
 def create_spark_session():
@@ -64,6 +69,7 @@ def run_bronze_pipeline(spark):
         .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", "latest")
         .option("failOnDataLoss", "false")
+        .option("includeHeaders", "true")
         .load())
     
     # Transform to bronze format
@@ -71,7 +77,8 @@ def run_bronze_pipeline(spark):
         .select(
             F.col("value").cast("string").alias("raw_json"),
             F.col("timestamp").alias("kafka_ts"),
-            F.col("topic"), F.col("partition"), F.col("offset")
+            F.col("topic"), F.col("partition"), F.col("offset"),
+            F.col("headers").alias("headers")
         ))
     
     # Write to Delta
@@ -112,9 +119,9 @@ def run_silver_pipeline(spark):
     """Silver: parse, validate, dedupe"""
     logger.info("Starting Silver pipeline...")
     
-    bronze_path = f"{DELTA_PATH}/bronze_events"
     silver_path = f"{DELTA_PATH}/silver_events"
     checkpoint_path = f"/checkpoints/silver"
+    bronze_path = f"{DELTA_PATH}/bronze_events"
     
     # Wait for bronze table to have data
     if not wait_for_delta_table(spark, bronze_path):

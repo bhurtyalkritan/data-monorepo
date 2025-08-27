@@ -70,6 +70,15 @@ services:
       - KAFKA_TOPIC=ecommerce_events
       - DUCKDB_PATH=/delta/lakehouse.db
       - DELTA_PATH=/delta
+      - SPARK_DRIVER_MEMORY=4g
+      - SPARK_EXECUTOR_MEMORY=4g
+      - SPARK_DRIVER_MAX_RESULT_SIZE=2g
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+        reservations:
+          memory: 4g
     restart: unless-stopped
 
   # LLM Assistant API

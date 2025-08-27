@@ -18,9 +18,9 @@ DUCKDB_PATH = os.getenv("DUCKDB_PATH", "/delta/lakehouse.db")
 
 # Tunables
 SILVER_WATERMARK = os.getenv("SILVER_WATERMARK", "10 minutes")
-GOLD_WATERMARK = os.getenv("GOLD_WATERMARK", "30 seconds")
-ENABLE_GOLD_MERGE_BACKFILL = os.getenv("ENABLE_GOLD_MERGE_BACKFILL", "0").lower() in ("1","true","yes")
-MERGE_INTERVAL_SEC = int(os.getenv("MERGE_INTERVAL_SEC", "120"))
+GOLD_WATERMARK = os.getenv("GOLD_WATERMARK", "10 minutes")
+ENABLE_GOLD_MERGE_BACKFILL = os.getenv("ENABLE_GOLD_MERGE_BACKFILL", "1").lower() in ("1","true","yes")
+MERGE_INTERVAL_SEC = int(os.getenv("MERGE_INTERVAL_SEC", "30"))
 
 # Event schema (updated with new attributes)
 event_schema = StructType([
@@ -43,6 +43,11 @@ event_schema = StructType([
 
 def create_spark_session():
     """Create Spark session with Delta Lake support"""
+    # Memory configuration from environment
+    driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "4g")
+    executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "4g")
+    max_result_size = os.getenv("SPARK_DRIVER_MAX_RESULT_SIZE", "2g")
+    
     builder = (SparkSession.builder
         .appName("RT-Lakehouse-Streaming")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
@@ -51,7 +56,20 @@ def create_spark_session():
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.adaptive.skewJoin.enabled", "true"))
+        .config("spark.sql.adaptive.skewJoin.enabled", "true")
+        # Memory configuration
+        .config("spark.driver.memory", driver_memory)
+        .config("spark.executor.memory", executor_memory)
+        .config("spark.driver.maxResultSize", max_result_size)
+        # Additional memory optimizations
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .config("spark.executor.memoryFraction", "0.8")
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128MB")
+        # Delta Lake time travel configuration
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+        .config("spark.databricks.delta.vacuum.parallelDelete.enabled", "true")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog"))
     
     return configure_spark_with_delta_pip(builder).getOrCreate()
 
@@ -176,47 +194,41 @@ def run_gold_pipeline(spark):
               .load(silver_path)
               .withWatermark("ts", GOLD_WATERMARK))
     
-    # 1-minute windows
+    # 1-minute windows with comprehensive aggregation
     win = F.window("ts", "1 minute")
     
-    # Aggregations
-    views = (events.filter(F.col("event_type") == "page_view")
-             .groupBy(win)
-             .agg(F.approx_count_distinct("user_id").alias("view_users")))
-    
-    purchases = (events.filter(F.col("event_type") == "purchase")
-                 .withColumn("revenue", F.col("price") * F.col("quantity"))
-                 .groupBy(win)
-                 .agg(
-                     F.count("*").alias("orders"),
-                     F.sum("revenue").alias("gmv"),
-                     F.approx_count_distinct("user_id").alias("purchase_users")))
-    
-    active = (events.groupBy(win)
-              .agg(F.approx_count_distinct("user_id").alias("active_users")))
-    
-    # Join and calculate conversion rate
-    gold = (purchases.join(views, on="window", how="fullouter")
-                     .join(active, on="window", how="fullouter")
-                     .select(
-                         F.col("window.start").alias("window_start"),
-                         F.col("window.end").alias("window_end"),
-                         F.coalesce("orders", F.lit(0)).alias("orders"),
-                         F.coalesce("gmv", F.lit(0.0)).alias("gmv"),
-                         F.coalesce("purchase_users", F.lit(0)).alias("purchase_users"),
-                         F.coalesce("view_users", F.lit(0)).alias("view_users"),
-                         F.coalesce("active_users", F.lit(0)).alias("active_users"),
-                         (F.col("purchase_users") / F.when(F.col("view_users") == 0, F.lit(1)).otherwise(F.col("view_users"))).alias("conversion_rate")))
-    
+    # Single aggregation with all metrics
+    gold = (events
+            .groupBy(win)
+            .agg(
+                F.count("*").alias("total_events"),
+                F.approx_count_distinct("user_id").alias("active_users"),
+                F.sum(F.when(F.col("event_type") == "purchase", 1).otherwise(0)).alias("orders"),
+                F.sum(F.when(F.col("event_type") == "purchase", F.col("price") * F.col("quantity")).otherwise(0.0)).alias("gmv"),
+                F.approx_count_distinct(F.when(F.col("event_type") == "purchase", F.col("user_id"))).alias("purchase_users"),
+                F.approx_count_distinct(F.when(F.col("event_type") == "page_view", F.col("user_id"))).alias("view_users")
+            )
+            .select(
+                F.col("window.start").alias("window_start"),
+                F.col("window.end").alias("window_end"),
+                F.col("orders"),
+                F.col("gmv"),
+                F.col("purchase_users"),
+                F.col("view_users"),
+                F.col("active_users"),
+                (F.col("purchase_users").cast("double") / 
+                 F.when(F.col("view_users") == 0, F.lit(1)).otherwise(F.col("view_users"))).alias("conversion_rate")
+            ))
+
     # Write to Delta
     query = (gold.writeStream
         .format("delta")
         .option("checkpointLocation", checkpoint_path)
-        .outputMode("complete")
-        .trigger(processingTime="10 seconds")
+        .outputMode("append")
+        .trigger(processingTime="30 seconds")
         .option("path", gold_path)
         .start())
-    
+
     return query
 
 def setup_duckdb_integration(spark):
@@ -229,12 +241,25 @@ def setup_duckdb_integration(spark):
         gold_path = f"{DELTA_PATH}/gold_kpis"
         
         # Read latest data and write to parquet for DuckDB
-        silver_df = spark.read.format("delta").load(silver_path)
-        gold_df = spark.read.format("delta").load(gold_path)
+        try:
+            silver_df = spark.read.format("delta").load(silver_path)
+            silver_count = silver_df.count()
+            if silver_count > 0:
+                silver_df.write.mode("overwrite").parquet(f"{DELTA_PATH}/silver_latest.parquet")
+                logger.info(f"Exported {silver_count} silver records to parquet")
+        except Exception as e:
+            logger.warning(f"Silver export failed: {e}")
         
-        # Write to parquet (DuckDB can read this efficiently)
-        silver_df.write.mode("overwrite").parquet(f"{DELTA_PATH}/silver_latest.parquet")
-        gold_df.write.mode("overwrite").parquet(f"{DELTA_PATH}/gold_latest.parquet")
+        try:
+            gold_df = spark.read.format("delta").load(gold_path)
+            gold_count = gold_df.count()
+            if gold_count > 0:
+                gold_df.write.mode("overwrite").parquet(f"{DELTA_PATH}/gold_latest.parquet")
+                logger.info(f"Exported {gold_count} gold records to parquet")
+            else:
+                logger.warning("Gold table is empty, no export performed")
+        except Exception as e:
+            logger.warning(f"Gold export failed: {e}")
         
         logger.info("DuckDB integration setup complete")
     except Exception as e:
@@ -280,6 +305,116 @@ def run_gold_incremental_merge(spark):
     except Exception as e:
         logger.warning(f"Gold incremental MERGE failed: {e}")
 
+def get_table_history(spark, table_path, limit=10):
+    """Get Delta table version history for time travel"""
+    try:
+        from delta.tables import DeltaTable
+        delta_table = DeltaTable.forPath(spark, table_path)
+        history = delta_table.history(limit).collect()
+        
+        logger.info(f"Table {table_path} history (last {limit} versions):")
+        for row in history:
+            version = row['version']
+            timestamp = row['timestamp']
+            operation = row['operation']
+            logger.info(f"  Version {version}: {operation} at {timestamp}")
+        
+        return history
+    except Exception as e:
+        logger.warning(f"Failed to get history for {table_path}: {e}")
+        return []
+
+def read_table_at_version(spark, table_path, version=None, timestamp=None):
+    """Read Delta table at specific version or timestamp"""
+    try:
+        if version is not None:
+            df = spark.read.format("delta").option("versionAsOf", version).load(table_path)
+            logger.info(f"Reading {table_path} at version {version}")
+        elif timestamp is not None:
+            df = spark.read.format("delta").option("timestampAsOf", timestamp).load(table_path)
+            logger.info(f"Reading {table_path} at timestamp {timestamp}")
+        else:
+            df = spark.read.format("delta").load(table_path)
+            logger.info(f"Reading {table_path} latest version")
+        
+        return df
+    except Exception as e:
+        logger.error(f"Failed to read {table_path} at version/timestamp: {e}")
+        return None
+
+def setup_time_travel_views(spark):
+    """Create SQL views for easy time travel access"""
+    try:
+        bronze_path = f"{DELTA_PATH}/bronze_events"
+        silver_path = f"{DELTA_PATH}/silver_events"
+        gold_path = f"{DELTA_PATH}/gold_kpis"
+        
+        # Register Delta tables as SQL views for time travel queries
+        spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW bronze_events USING DELTA LOCATION '{bronze_path}'")
+        spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW silver_events USING DELTA LOCATION '{silver_path}'")
+        spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW gold_kpis USING DELTA LOCATION '{gold_path}'")
+        
+        logger.info("Time travel views created successfully")
+        
+        # Log table histories for debugging
+        get_table_history(spark, bronze_path, 5)
+        get_table_history(spark, silver_path, 5)
+        get_table_history(spark, gold_path, 5)
+        
+    except Exception as e:
+        logger.warning(f"Failed to setup time travel views: {e}")
+
+def export_time_travel_data(spark):
+    """Export time travel capabilities to DuckDB-accessible format"""
+    try:
+        bronze_path = f"{DELTA_PATH}/bronze_events"
+        silver_path = f"{DELTA_PATH}/silver_events"
+        gold_path = f"{DELTA_PATH}/gold_kpis"
+        
+        # Export table histories as JSON for API access
+        histories = {}
+        
+        for table_name, table_path in [
+            ("bronze", bronze_path),
+            ("silver", silver_path), 
+            ("gold", gold_path)
+        ]:
+            try:
+                from delta.tables import DeltaTable
+                delta_table = DeltaTable.forPath(spark, table_path)
+                history_df = delta_table.history(20)  # Last 20 versions
+                
+                # Convert to pandas and then to JSON
+                history_rows = history_df.select(
+                    "version", "timestamp", "operation", "operationParameters"
+                ).collect()
+                
+                histories[table_name] = [
+                    {
+                        "version": row.version,
+                        "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+                        "operation": row.operation,
+                        "parameters": row.operationParameters
+                    }
+                    for row in history_rows
+                ]
+                
+                # Export history to JSON file for API access
+                import json
+                with open(f"{DELTA_PATH}/{table_name}_history.json", "w") as f:
+                    json.dump(histories[table_name], f, indent=2)
+                
+                logger.info(f"Exported {table_name} history: {len(histories[table_name])} versions")
+                
+            except Exception as e:
+                logger.warning(f"Failed to export {table_name} history: {e}")
+                
+        return histories
+        
+    except Exception as e:
+        logger.warning(f"Time travel data export failed: {e}")
+        return {}
+
 def main():
     """Main streaming pipeline runner"""
     logger.info("Starting RT-Lakehouse streaming pipeline...")
@@ -311,7 +446,7 @@ def main():
                         run_gold_incremental_merge(spark)
                     except Exception as e:
                         logger.error(f"Merge loop error: {e}")
-                    time.sleep(max(10, MERGE_INTERVAL_SEC))
+                    time.sleep(max(30, MERGE_INTERVAL_SEC))
             threading.Thread(target=_merge_loop, daemon=True).start()
         
         # Setup DuckDB integration (periodic)
@@ -319,10 +454,13 @@ def main():
             while True:
                 try:
                     setup_duckdb_integration(spark)
-                    time.sleep(60)  # Update every minute
+                    # Setup time travel views and export history data
+                    setup_time_travel_views(spark)
+                    export_time_travel_data(spark)
+                    time.sleep(30)  # Update every 30 seconds for faster refresh
                 except Exception as e:
                     logger.error(f"DuckDB update failed: {e}")
-                    time.sleep(60)
+                    time.sleep(30)
         
         import threading
         duckdb_thread = threading.Thread(target=update_duckdb, daemon=True)

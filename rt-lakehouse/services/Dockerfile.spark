@@ -31,5 +31,10 @@ COPY services/spark_runner.py /app/
 
 WORKDIR /app
 
-# Run streaming pipeline
+# Set Spark memory configuration
+ENV SPARK_DRIVER_MEMORY=${SPARK_DRIVER_MEMORY:-4g}
+ENV SPARK_EXECUTOR_MEMORY=${SPARK_EXECUTOR_MEMORY:-4g}
+ENV SPARK_DRIVER_MAX_RESULT_SIZE=${SPARK_DRIVER_MAX_RESULT_SIZE:-2g}
+
+# Run streaming pipeline with proper Spark configuration
 CMD ["python3", "spark_runner.py"]

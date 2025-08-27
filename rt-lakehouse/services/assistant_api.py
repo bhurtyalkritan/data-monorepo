@@ -61,6 +61,17 @@ _start_time = time.time()
 # Helpers
 # -----------------------------------------------------
 
+def json_serializable(obj):
+    """Convert non-serializable objects to JSON-safe types"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [json_serializable(item) for item in obj]
+    else:
+        return obj
+
 def cached(key: str, ttl: int, loader):
     now = time.time()
     entry = _cache.get(key)
@@ -264,8 +275,54 @@ async def alerts_state(request: Request):
     return r
 
 # -----------------------------------------------------
-# Metrics & SSE
+# Latency tracking
 # -----------------------------------------------------
+@app.get("/latency")
+async def pipeline_latency(request: Request):
+    ratelimit(request)
+    
+    def load():
+        try:
+            # Get latest silver timestamp
+            silver_q = f"""
+            SELECT max(ts) as latest_ts
+            FROM read_parquet('{SILVER_PARQUET_GLOB}')
+            """
+            silver_result = duckdb_conn.execute(silver_q).fetchone()
+            silver_latest = silver_result[0] if silver_result and silver_result[0] else None
+            
+            # Get latest gold timestamp  
+            gold_q = f"""
+            SELECT max(window_start) as latest_window
+            FROM read_parquet('{GOLD_PARQUET_GLOB}')
+            """
+            gold_result = duckdb_conn.execute(gold_q).fetchone()
+            gold_latest = gold_result[0] if gold_result and gold_result[0] else None
+            
+            # Calculate lag in seconds
+            lag_sec = None
+            if silver_latest and gold_latest:
+                # Convert to timestamps and calculate difference
+                lag_q = f"""
+                SELECT extract(epoch from (TIMESTAMP '{silver_latest}' - TIMESTAMP '{gold_latest}'))
+                """
+                lag_result = duckdb_conn.execute(lag_q).fetchone()
+                lag_sec = abs(float(lag_result[0])) if lag_result and lag_result[0] is not None else None
+            
+            return {
+                "silver_latest": str(silver_latest) if silver_latest else None,
+                "gold_latest": str(gold_latest) if gold_latest else None, 
+                "lag_sec": lag_sec
+            }
+        except Exception as e:
+            logger.warning(f"Latency calculation failed: {e}")
+            return {"silver_latest": None, "gold_latest": None, "lag_sec": None}
+    
+    data, hit = cached("latency", ttl=15, loader=load)
+    r = JSONResponse(data)
+    r.headers["X-Cache"] = "HIT" if hit else "MISS"
+    r.headers["Cache-Control"] = "public, max-age=15"
+    return r
 async def load_latest_metrics() -> Dict[str, Any]:
     latest_kpis: Dict[str, Any] = {}
     try:
@@ -278,7 +335,7 @@ async def load_latest_metrics() -> Dict[str, Any]:
         row = cur.fetchone()
         if row:
             cols = [d[0] for d in cur.description]
-            latest_kpis = dict(zip(cols, row))
+            latest_kpis = json_serializable(dict(zip(cols, row)))
     except Exception:
         pass
 
@@ -316,7 +373,7 @@ async def load_latest_metrics() -> Dict[str, Any]:
         row = cur.fetchone()
         if row:
             cols = [d[0] for d in cur.description]
-            latest_kpis = dict(zip(cols, row))
+            latest_kpis = json_serializable(dict(zip(cols, row)))
 
     cur2 = duckdb_conn.execute(
         f"""
@@ -385,7 +442,7 @@ async def conversion_trend(request: Request, limit: int = Query(60, ge=1, le=100
             rows = cur.fetchall()
             if rows:
                 cols = [d[0] for d in cur.description]
-                return {"results": [dict(zip(cols, r)) for r in rows]}
+                return {"results": [json_serializable(dict(zip(cols, r))) for r in rows]}
         except Exception:
             pass
         where2 = f"AND CAST(ts AS TIMESTAMP) <= TIMESTAMP '{as_of_sql}'" if as_of_sql else ""
@@ -408,7 +465,7 @@ async def conversion_trend(request: Request, limit: int = Query(60, ge=1, le=100
         """
         cur = duckdb_conn.execute(q2)
         cols = [d[0] for d in cur.description]
-        return {"results": [dict(zip(cols, r)) for r in cur.fetchall()]}
+        return {"results": [json_serializable(dict(zip(cols, r))) for r in cur.fetchall()]}
 
     key = f"trend:conv:{limit}:{as_of_sql or 'latest'}"
     data, hit = cached(key, ttl=5, loader=load)
@@ -436,7 +493,7 @@ async def revenue_trend(request: Request, limit: int = Query(60, ge=1, le=1000),
             rows = cur.fetchall()
             if rows:
                 cols = [d[0] for d in cur.description]
-                return {"results": [dict(zip(cols, r)) for r in rows]}
+                return {"results": [json_serializable(dict(zip(cols, r))) for r in rows]}
         except Exception:
             pass
         where2 = f"AND CAST(ts AS TIMESTAMP) <= TIMESTAMP '{as_of_sql}'" if as_of_sql else ""
@@ -449,7 +506,7 @@ async def revenue_trend(request: Request, limit: int = Query(60, ge=1, le=1000),
         """
         cur = duckdb_conn.execute(q2)
         cols = [d[0] for d in cur.description]
-        return {"results": [dict(zip(cols, r)) for r in cur.fetchall()]}
+        return {"results": [json_serializable(dict(zip(cols, r))) for r in cur.fetchall()]}
 
     key = f"trend:rev:{limit}:{as_of_sql or 'latest'}"
     data, hit = cached(key, ttl=5, loader=load)
@@ -556,7 +613,7 @@ async def ml_features(limit: int = Query(20, ge=1, le=1000)):
     """
     cur = duckdb_conn.execute(q)
     cols = [d[0] for d in cur.description]
-    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    rows = [json_serializable(dict(zip(cols, r))) for r in cur.fetchall()]
     return {"features": rows}
 
 # -----------------------------------------------------
@@ -625,7 +682,7 @@ async def query_data(request: Request, body: Dict[str, Any]):
         cur = duckdb_conn.execute(sql)
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
-        results = [dict(zip(cols, r)) for r in rows]
+        results = [json_serializable(dict(zip(cols, r))) for r in rows]
 
         chart = None
         if include_chart and results:
@@ -685,6 +742,171 @@ async def backfill_gold():
         return {"materialized_rows": int(cnt), "table": "gold_kpis_tbl"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------
+# Time Travel API endpoints
+# -----------------------------------------------------
+@app.get("/timetravel/history/{table}")
+async def get_table_history(request: Request, table: str, limit: int = Query(10, ge=1, le=100)):
+    """Get Delta table version history"""
+    ratelimit(request)
+    
+    # Validate table name
+    if table not in ["bronze", "silver", "gold"]:
+        raise HTTPException(status_code=400, detail="Table must be bronze, silver, or gold")
+    
+    try:
+        # Read history JSON file exported by Spark
+        import json
+        history_file = f"/delta/{table}_history.json"
+        
+        with open(history_file, 'r') as f:
+            history = json.load(f)
+        
+        # Return limited results
+        limited_history = history[:limit] if history else []
+        
+        return {
+            "table": table,
+            "versions": limited_history,
+            "total_versions": len(history) if history else 0
+        }
+        
+    except FileNotFoundError:
+        return {
+            "table": table,
+            "versions": [],
+            "total_versions": 0,
+            "message": "History not available yet"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get history: {e}")
+
+@app.get("/timetravel/data/{table}")
+async def get_time_travel_data(
+    request: Request, 
+    table: str, 
+    version: Optional[int] = None,
+    timestamp: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=10000)
+):
+    """Get data from Delta table at specific version or timestamp"""
+    ratelimit(request)
+    
+    # Validate table name
+    if table not in ["bronze", "silver", "gold"]:
+        raise HTTPException(status_code=400, detail="Table must be bronze, silver, or gold")
+    
+    if version is None and timestamp is None:
+        raise HTTPException(status_code=400, detail="Either version or timestamp must be provided")
+    
+    try:
+        # For now, return current data with metadata about time travel request
+        # In a production system, you'd use Delta Lake's time travel APIs
+        
+        table_map = {
+            "bronze": "/delta/bronze_events",
+            "silver": SILVER_PARQUET_GLOB,
+            "gold": GOLD_PARQUET_GLOB
+        }
+        
+        # Read current data (time travel would require Spark/Delta integration)
+        if table == "bronze":
+            # Bronze is Delta format, we'd need Spark for true time travel
+            return {
+                "table": table,
+                "version": version,
+                "timestamp": timestamp,
+                "message": "Bronze time travel requires Spark Delta integration",
+                "data": []
+            }
+        else:
+            # For silver/gold, read from parquet (current snapshot)
+            q = f"SELECT * FROM read_parquet('{table_map[table]}') ORDER BY ts DESC LIMIT {limit}" if table == "silver" else f"SELECT * FROM read_parquet('{table_map[table]}') ORDER BY window_start DESC LIMIT {limit}"
+            
+            cur = duckdb_conn.execute(q)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            data = [json_serializable(dict(zip(cols, r))) for r in rows]
+            
+            return {
+                "table": table,
+                "version": version,
+                "timestamp": timestamp,
+                "message": f"Showing current {table} data (time travel integration pending)",
+                "data": data,
+                "count": len(data)
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Time travel query failed: {e}")
+
+@app.get("/timetravel/compare/{table}")
+async def compare_table_versions(
+    request: Request,
+    table: str,
+    version1: int,
+    version2: int,
+    metric: str = Query("count", description="Metric to compare: count, sum, avg")
+):
+    """Compare metrics between two table versions"""
+    ratelimit(request)
+    
+    if table not in ["bronze", "silver", "gold"]:
+        raise HTTPException(status_code=400, detail="Table must be bronze, silver, or gold")
+    
+    try:
+        # Get history to validate versions exist
+        history_file = f"/delta/{table}_history.json"
+        with open(history_file, 'r') as f:
+            history = json.load(f)
+        
+        # Find version details
+        v1_info = next((v for v in history if v["version"] == version1), None)
+        v2_info = next((v for v in history if v["version"] == version2), None)
+        
+        if not v1_info or not v2_info:
+            raise HTTPException(status_code=400, detail="One or both versions not found")
+        
+        # For now, return metadata comparison
+        return {
+            "table": table,
+            "comparison": {
+                "version1": {
+                    "version": version1,
+                    "timestamp": v1_info["timestamp"],
+                    "operation": v1_info["operation"]
+                },
+                "version2": {
+                    "version": version2,
+                    "timestamp": v2_info["timestamp"], 
+                    "operation": v2_info["operation"]
+                }
+            },
+            "metric": metric,
+            "message": "Version comparison available - data diff requires Spark Delta integration"
+        }
+        
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Table history not available")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {e}")
+
+@app.get("/timetravel/restore/{table}")
+async def restore_table_version(request: Request, table: str, version: int):
+    """Restore table to specific version (metadata only)"""
+    ratelimit(request)
+    
+    if table not in ["bronze", "silver", "gold"]:
+        raise HTTPException(status_code=400, detail="Table must be bronze, silver, or gold")
+    
+    # This would require Spark/Delta integration for actual restore
+    return {
+        "table": table,
+        "target_version": version,
+        "status": "planned",
+        "message": "Table restore requires Spark Delta integration - this is a preview endpoint"
+    }
 
 # -----------------------------------------------------
 # Security / whoami

@@ -222,13 +222,13 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             
-      - name: Build and push Docker image
+      - name: Build Docker image (no push for demo)
         if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         uses: docker/build-push-action@v5
         with:
           context: rt-lakehouse/
           file: rt-lakehouse/services/Dockerfile.${{ matrix.service }}
-          push: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

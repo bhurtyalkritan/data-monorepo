@@ -15,11 +15,20 @@
 !rt-lakehouse/Dockerfile.railway
 !rt-lakehouse/Caddyfile
 
-# Essential directories
+# Essential directories and their contents
 !rt-lakehouse/services/
+!rt-lakehouse/services/**
+!rt-lakehouse/services/*.py
+!rt-lakehouse/services/*.txt
 !rt-lakehouse/pipelines/
+!rt-lakehouse/pipelines/**
+!rt-lakehouse/pipelines/*.py
 !rt-lakehouse/sql/
+!rt-lakehouse/sql/**
+!rt-lakehouse/sql/*.sql
 !rt-lakehouse/producers/
+!rt-lakehouse/producers/**
+!rt-lakehouse/producers/*.py
 
 # Within services, include everything except heavy files
 rt-lakehouse/services/frontend/node_modules/

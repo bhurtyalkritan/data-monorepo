@@ -1,10 +1,10 @@
 [flake8]
 max-line-length = 100
 ignore = 
-    E501,  # line too long
-    W503,  # line break before binary operator
-    F403,  # star imports (needed for PySpark)
-    F405   # undefined names from star imports
+    E501,
+    W503,
+    F403,
+    F405
 exclude = 
     .git,
     __pycache__,

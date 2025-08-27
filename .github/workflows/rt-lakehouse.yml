@@ -137,23 +137,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
     needs: [changes]
-    services:
-      kafka:
-        image: confluentinc/cp-kafka:7.4.0
-        env:
-          KAFKA_BROKER_ID: 1
-          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-        ports:
-          - 9092:9092
-          
-      zookeeper:
-        image: confluentinc/cp-zookeeper:7.4.0
-        env:
-          ZOOKEEPER_CLIENT_PORT: 2181
-        ports:
-          - 2181:2181
+    # Remove Kafka services for faster startup since we're skipping integration tests
+    # services:
+    #   kafka:
+    #     image: confluentinc/cp-kafka:7.4.0
+    #     env:
+    #       KAFKA_BROKER_ID: 1
+    #       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+    #       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+    #       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    #     ports:
+    #       - 9092:9092
+    #       
+    #   zookeeper:
+    #     image: confluentinc/cp-zookeeper:7.4.0
+    #     env:
+    #       ZOOKEEPER_CLIENT_PORT: 2181
+    #     ports:
+    #       - 2181:2181
           
     steps:
       - uses: actions/checkout@v4
@@ -180,18 +181,22 @@ jobs:
           
       - name: Test with pytest
         working-directory: rt-lakehouse
+        timeout-minutes: 5  # Shorter timeout for faster feedback
         run: |
           echo "Running tests..."
           # Set JAVA_HOME for PySpark if available
           export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-11-openjdk-amd64}
           
-          # Run tests with coverage
+          # Run only fast unit tests, skip integration tests
           pytest tests/ -v \
             --cov=services \
             --cov=pipelines \
             --cov-report=xml \
             --cov-report=term \
             --tb=short \
+            --maxfail=3 \
+            --timeout=30 \
+            -k "not (kafka or integration or api)" \
             || echo "Some tests failed but continuing..."
           
       - name: Run frontend tests

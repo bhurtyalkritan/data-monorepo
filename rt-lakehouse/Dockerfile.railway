@@ -42,20 +42,23 @@ COPY rt-lakehouse/ /app/
 # Set final working directory
 WORKDIR /app
 
+# Create required directories for Railway demo
+RUN mkdir -p /delta
+
 # Create startup script
 RUN echo '#!/bin/bash\n\
 echo "Starting RT-Lakehouse Assistant API for Railway..."\n\
 echo "Checking file structure..."\n\
 ls -la /app/\n\
 ls -la /app/services/ || echo "Services directory not found"\n\
-if [ -f "/app/services/assistant_api.py" ]; then\n\
+if [ -f "/app/services/assistant_railway.py" ]; then\n\
+    echo "Found assistant_railway.py (Railway-optimized), starting..."\n\
+    cd /app/services && python assistant_railway.py\n\
+elif [ -f "/app/services/assistant_api.py" ]; then\n\
     echo "Found assistant_api.py, starting..."\n\
     cd /app/services && python assistant_api.py\n\
-elif [ -f "/app/assistant_api.py" ]; then\n\
-    echo "Found assistant_api.py in root, starting..."\n\
-    cd /app && python assistant_api.py\n\
 else\n\
-    echo "ERROR: assistant_api.py not found!"\n\
+    echo "ERROR: No assistant API found!"\n\
     find /app -name "*.py" -type f\n\
     exit 1\n\
 fi' > /app/start.sh && chmod +x /app/start.sh

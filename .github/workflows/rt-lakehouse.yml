@@ -66,8 +66,7 @@ jobs:
           
       - name: Install Python dependencies
         run: |
-          pip install black flake8 isort mypy
-          pip install -r rt-lakehouse/services/requirements-assistant.txt
+          pip install -r rt-lakehouse/requirements-test.txt
           
       - name: Lint with flake8
         working-directory: rt-lakehouse
@@ -160,11 +159,15 @@ jobs:
         with:
           python-version: '3.11'
           
+      - name: Set up Java (for PySpark)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+          
       - name: Install dependencies
         run: |
-          pip install pytest pytest-cov pytest-asyncio
-          pip install -r rt-lakehouse/services/requirements-assistant.txt
-          pip install -r rt-lakehouse/services/requirements-producer.txt
+          pip install -r rt-lakehouse/requirements-test.txt
           
       - name: Set up test environment
         run: |
@@ -179,12 +182,12 @@ jobs:
           export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-11-openjdk-amd64}
           
           # Run tests with coverage
-          pytest tests/ -v 
-            --cov=services 
-            --cov=pipelines 
-            --cov-report=xml 
-            --cov-report=term 
-            --tb=short 
+          pytest tests/ -v \
+            --cov=services \
+            --cov=pipelines \
+            --cov-report=xml \
+            --cov-report=term \
+            --tb=short \
             || echo "Some tests failed but continuing..."
           
       - name: Run frontend tests

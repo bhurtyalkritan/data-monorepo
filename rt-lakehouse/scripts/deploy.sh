@@ -1,13 +1,9 @@
 #!/bin/bash
-# RT-Lakehouse deployment script for production environments
+
+# RT-Lakehouse Deployment Script
+# Supports multiple deployment targets
 
 set -e
-
-# Configuration
-PROJECT_NAME="rt-lakehouse"
-DOCKER_REGISTRY="ghcr.io"
-NAMESPACE="${NAMESPACE:-rt-lakehouse}"
-ENVIRONMENT="${ENVIRONMENT:-production}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,36 +11,169 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+# Configuration
+REPO_URL="https://github.com/bhurtyalkritan/data-monorepo.git"
+PROJECT_NAME="rt-lakehouse"
+
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
+print_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if required tools are installed
+check_requirements() {
+    print_status "Checking requirements..."
+    
+    if ! command -v docker &> /dev/null; then
+        print_error "Docker is required but not installed"
+        exit 1
+    fi
+    
+    if ! command -v docker-compose &> /dev/null; then
+        print_error "Docker Compose is required but not installed"
+        exit 1
+    fi
+    
+    print_status "All requirements satisfied"
+}
+
+# Deploy to Railway
+deploy_railway() {
+    print_status "Deploying to Railway..."
+    
+    # Install Railway CLI if not present
+    if ! command -v railway &> /dev/null; then
+        print_status "Installing Railway CLI..."
+        npm install -g @railway/cli
+    fi
+    
+    # Login and deploy
+    railway login
+    railway link
+    railway up
+    
+    print_status "Railway deployment initiated"
+    print_status "Check status at: https://railway.app/dashboard"
+}
+
+# Deploy to DigitalOcean
+deploy_digitalocean() {
+    print_status "Deploying to DigitalOcean..."
+    
+    # Check for doctl
+    if ! command -v doctl &> /dev/null; then
+        print_error "DigitalOcean CLI (doctl) is required"
+        print_status "Install with: brew install doctl"
+        exit 1
+    fi
+    
+    read -p "Enter your DigitalOcean access token: " DO_TOKEN
+    read -p "Enter domain name (or press enter for IP): " DOMAIN
+    
+    doctl auth init --access-token "$DO_TOKEN"
+    
+    # Create droplet
+    print_status "Creating DigitalOcean droplet..."
+    DROPLET_ID=$(doctl compute droplet create rt-lakehouse 
+        --image docker-20-04 
+        --size s-4vcpu-8gb 
+        --region nyc1 
+        --ssh-keys $(doctl compute ssh-key list --format ID --no-header) 
+        --format ID --no-header)
+    
+    print_status "Droplet created with ID: $DROPLET_ID"
+    
+    # Wait for droplet to be ready
+    print_status "Waiting for droplet to be ready..."
+    sleep 60
+    
+    DROPLET_IP=$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header)
+    print_status "Droplet IP: $DROPLET_IP"
+    
+    # Deploy via SSH
+    ssh root@"$DROPLET_IP" << EOF
+        # Clone repository
+        git clone $REPO_URL
+        cd data-monorepo/rt-lakehouse
+        
+        # Set environment variables
+        export DOMAIN=${DOMAIN:-$DROPLET_IP}
+        
+        # Deploy
+        docker-compose -f docker-compose.yml -f docker-compose.production.yml up -d
+EOF
+    
+    print_status "DigitalOcean deployment complete"
+    print_status "Access your application at: http://${DOMAIN:-$DROPLET_IP}"
+}
+
+# Deploy locally for development
+deploy_local() {
+    print_status "Deploying locally..."
+    
+    # Stop any existing containers
+    docker-compose down 2>/dev/null || true
+    
+    # Build and start
+    docker-compose up --build -d
+    
+    print_status "Local deployment complete"
+    print_status "Frontend: http://localhost:3000"
+    print_status "API: http://localhost:8000"
+    print_status "Monitoring: http://localhost:8501"
+}
+
+# Main deployment function
+deploy() {
+    local target=$1
+    
+    print_status "Starting RT-Lakehouse deployment to: $target"
+    
+    check_requirements
+    
+    case $target in
+        railway)
+            deploy_railway
+            ;;
+        digitalocean|do)
+            deploy_digitalocean
+            ;;
+        local)
+            deploy_local
+            ;;
+        *)
+            print_error "Unknown deployment target: $target"
+            echo "Usage: $0 {railway|digitalocean|local}"
+            exit 1
+            ;;
+    esac
+    
+    print_status "Deployment to $target completed!"
+}
+
+# Show usage if no arguments
+if [ $# -eq 0 ]; then
+    echo "RT-Lakehouse Deployment Script"
+    echo ""
+    echo "Usage: $0 {railway|digitalocean|local}"
+    echo ""
+    echo "Deployment targets:"
+    echo "  railway       - Deploy to Railway (recommended for demos)"
+    echo "  digitalocean  - Deploy to DigitalOcean Droplet"
+    echo "  local        - Deploy locally for development"
+    echo ""
     exit 1
-}
+fi
 
-# Validate required environment variables
-validate_environment() {
-    log "Validating environment variables..."
-    
-    required_vars=(
-        "GITHUB_SHA"
-        "ENVIRONMENT"
-    )
-    
-    for var in "${required_vars[@]}"; do
-        if [[ -z "${!var}" ]]; then
-            error "Required environment variable $var is not set"
-        fi
-    done
-    
-    log "Environment validation passed"
-}
+# Execute deployment
+deploy "$1"
 
 # Pre-deployment health checks
 pre_deployment_checks() {

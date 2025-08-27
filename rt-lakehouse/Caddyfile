@@ -1,0 +1,39 @@
+# Caddyfile for RT-Lakehouse Production
+{$DOMAIN:localhost} {
+    # Main application routes
+    handle_path /api/* {
+        reverse_proxy assistant-api:8000
+    }
+    
+    handle_path /monitoring/* {
+        reverse_proxy monitoring:8501
+    }
+    
+    # Frontend (React app)
+    handle /* {
+        reverse_proxy frontend:3000
+    }
+    
+    # Enable compression
+    encode gzip
+    
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    
+    # Logging
+    log {
+        output file /var/log/caddy/access.log
+        level INFO
+    }
+}
+
+# Health check endpoint
+:8080 {
+    respond /health "OK" 200
+}

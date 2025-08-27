@@ -1,0 +1,97 @@
+# Production Docker Compose Configuration
+version: '3.8'
+
+services:
+  # Reverse proxy with automatic HTTPS
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+
+  # Override services for production
+  qdrant:
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 1g
+
+  kafka:
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx2g -Xms2g"
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 2g
+
+  spark-streaming:
+    environment:
+      - SPARK_DRIVER_MEMORY=6g
+      - SPARK_EXECUTOR_MEMORY=6g
+      - SPARK_DRIVER_MAX_RESULT_SIZE=4g
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+        reservations:
+          memory: 6g
+
+  assistant-api:
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+      - API_WORKERS=4
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 1g
+    restart: unless-stopped
+
+  frontend:
+    environment:
+      - NODE_ENV=production
+      - REACT_APP_API_URL=https://${DOMAIN:-localhost}/api
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+        reservations:
+          memory: 512m
+    restart: unless-stopped
+
+  monitoring:
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+        reservations:
+          memory: 512m
+    restart: unless-stopped
+
+  producer:
+    environment:
+      - EVENTS_PER_SEC=200
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+        reservations:
+          memory: 512m
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

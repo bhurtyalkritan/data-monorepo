@@ -1,0 +1,10 @@
+# Railway Configuration
+# This file configures Railway deployment for RT-Lakehouse Frontend
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "rt-lakehouse/services/Dockerfile.frontend"
+
+[env]
+# Frontend configuration
+NODE_ENV = "production"

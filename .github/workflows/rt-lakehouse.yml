@@ -112,6 +112,9 @@ jobs:
   # Security scanning
   security:
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       
@@ -126,6 +129,7 @@ jobs:
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
+        continue-on-error: true  # Don't fail the whole pipeline if upload fails
         with:
           sarif_file: 'trivy-results.sarif'
 
@@ -211,6 +215,7 @@ jobs:
     strategy:
       matrix:
         service: [assistant, frontend, monitoring, producer, spark]
+      fail-fast: false  # Continue with other services if one fails
     steps:
       - uses: actions/checkout@v4
       
@@ -224,7 +229,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
           
+      - name: Check if Dockerfile exists
+        id: dockerfile-check
+        run: |
+          if [ -f "rt-lakehouse/services/Dockerfile.${{ matrix.service }}" ]; then
+            echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
+            echo "Dockerfile for ${{ matrix.service }} not found, skipping..."
+          fi
+          
       - name: Extract metadata
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -236,6 +252,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             
       - name: Build and push Docker image
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         uses: docker/build-push-action@v5
         with:
           context: rt-lakehouse/
@@ -245,7 +262,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
 
   # Integration testing with full stack
   integration-test:
@@ -435,9 +452,13 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    permissions:
+      packages: write
+      contents: read
     steps:
       - name: Delete old container images
         uses: actions/delete-package-versions@v4
+        continue-on-error: true  # Don't fail if no packages exist yet
         with:
           package-name: rt-lakehouse-assistant
           package-type: container

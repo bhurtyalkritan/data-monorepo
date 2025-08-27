@@ -12,7 +12,7 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
 httpx==0.25.2
-anyio==4.0.0
+anyio>=3.7.1,<4.0.0  # Fixed: Compatible with FastAPI
 python-multipart==0.0.6
 aiofiles==23.2.0
 python-dotenv==1.0.0

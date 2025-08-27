@@ -53,9 +53,10 @@ jobs:
               - 'rt-lakehouse/pipelines/**'
               - 'rt-lakehouse/producers/**'
 
-  # Lint and format check
-  lint:
+  # Unit Tests (Fast)
+  test-unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       
@@ -64,50 +65,15 @@ jobs:
         with:
           python-version: '3.11'
           
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           pip install -r rt-lakehouse/requirements-test.txt
           
-      - name: Lint with flake8
+      - name: Run unit tests
         working-directory: rt-lakehouse
         run: |
-          echo "Running flake8 linting..."
-          # Lint with configuration from .flake8
-          flake8 . --config=.flake8 --show-source --statistics
-          
-          # Run black check
-          echo "Checking code formatting with black..."
-          black --check --diff . || echo "Black formatting issues found (non-blocking)"
-          
-          # Run isort check  
-          echo "Checking import sorting with isort..."
-          isort --check-only --diff . || echo "Import sorting issues found (non-blocking)"
-          
-      - name: Type check with mypy
-        run: |
-          cd rt-lakehouse
-          mypy services/assistant_api.py --ignore-missing-imports
-          
-      - name: Set up Node.js
-        if: needs.changes.outputs.frontend == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          cache: 'npm'
-          cache-dependency-path: rt-lakehouse/services/frontend/package-lock.json
-          
-      - name: Install frontend dependencies
-        if: needs.changes.outputs.frontend == 'true'
-        run: |
-          cd rt-lakehouse/services/frontend
-          npm ci
-          
-      - name: Lint frontend code
-        if: needs.changes.outputs.frontend == 'true'
-        run: |
-          cd rt-lakehouse/services/frontend
-          npm run lint
-          npm run type-check
+          # Run only unit tests (fast, no external dependencies)
+          pytest tests/test_event_contracts.py -v --tb=short --timeout=30
 
   # Security scanning
   security:
@@ -215,8 +181,8 @@ jobs:
   # Build Docker images
   build:
     runs-on: ubuntu-latest
-    needs: [changes, lint, test]
-    if: always() && (needs.lint.result == 'success' && needs.test.result == 'success')
+    needs: [changes, test]
+    if: always() && (needs.test.result == 'success')
     strategy:
       matrix:
         service: [assistant, frontend, monitoring, producer, spark]

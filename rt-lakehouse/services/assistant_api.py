@@ -14,6 +14,7 @@ import duckdb
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from openai import OpenAI
 
 # -----------------------------------------------------
 # Logging & env
@@ -36,6 +37,11 @@ RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60")) # seconds
 TENANT_ENFORCE = os.getenv("TENANT_ENFORCE", "false").lower() in ("1", "true", "yes")
 TENANT_COLUMN = os.getenv("TENANT_COLUMN", "tenant_id")
 
+# AI Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3.1-8b-instruct:free")
+
 # -----------------------------------------------------
 # App & CORS
 # -----------------------------------------------------
@@ -56,6 +62,64 @@ _cache: Dict[str, Dict[str, Any]] = {}
 _cache_stats = {"hits": 0, "misses": 0}
 _rate_buckets: Dict[str, deque] = {}
 _start_time = time.time()
+
+# AI Client
+openai_client = None
+if OPENAI_API_KEY:
+    try:
+        openai_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL
+        )
+        logger.info("OpenAI client initialized with base URL: %s", OPENAI_BASE_URL)
+    except Exception as e:
+        logger.warning("Failed to initialize OpenAI client: %s", e)
+
+# AI Knowledge Base
+SCHEMA_CONTEXT = """
+Database Schema:
+- silver_events: Raw e-commerce events with columns: event_id, user_id, session_id, event_type, ts, product_id, price, quantity, currency, country, device, ua
+- gold_kpis: Aggregated KPIs with columns: window_start, window_end, orders, gmv, conversion_rate, active_users, purchase_users, view_users
+
+Common patterns:
+- Conversion rate = purchase_users / view_users
+- GMV = sum of (price * quantity) for purchase events
+- Time windows are typically 1-minute aggregates
+- For time-based queries, use window_start for gold_kpis and ts for silver_events
+"""
+
+AI_KNOWLEDGE_BASE = [
+    {
+        "text": "Show conversion rate over time",
+        "sql": f"SELECT window_start, conversion_rate FROM read_parquet('{GOLD_PARQUET_GLOB}') ORDER BY window_start DESC LIMIT 60",
+        "pattern": "conversion_trend"
+    },
+    {
+        "text": "Show revenue trend GMV over time",
+        "sql": f"SELECT window_start, gmv FROM read_parquet('{GOLD_PARQUET_GLOB}') ORDER BY window_start DESC LIMIT 60",
+        "pattern": "revenue_trend"
+    },
+    {
+        "text": "Count events by type in the last hour",
+        "sql": f"SELECT event_type, COUNT(*) as count FROM read_parquet('{SILVER_PARQUET_GLOB}') WHERE ts >= NOW() - INTERVAL '1 hour' GROUP BY event_type",
+        "pattern": "event_counts"
+    },
+    {
+        "text": "Top products by revenue",
+        "sql": f"SELECT product_id, SUM(price * quantity) as revenue FROM read_parquet('{SILVER_PARQUET_GLOB}') WHERE event_type = 'purchase' GROUP BY product_id ORDER BY revenue DESC LIMIT 10",
+        "pattern": "top_products"
+    },
+    {
+        "text": "Active users in the last hour",
+        "sql": f"SELECT COUNT(DISTINCT user_id) as active_users FROM read_parquet('{SILVER_PARQUET_GLOB}') WHERE ts >= NOW() - INTERVAL '1 hour'",
+        "pattern": "active_users"
+    },
+    {
+        "text": "Country breakdown of users",
+        "sql": f"SELECT country, COUNT(DISTINCT user_id) as users FROM read_parquet('{SILVER_PARQUET_GLOB}') GROUP BY country ORDER BY users DESC LIMIT 10",
+        "pattern": "country_analysis"
+    }
+]
 
 # -----------------------------------------------------
 # Helpers
@@ -125,6 +189,90 @@ def setup_duckdb_views():
             )
     except Exception as e:
         logger.warning("View setup failed: %s", e)
+
+
+async def generate_sql_from_question(question: str) -> Dict[str, Any]:
+    """Use AI to convert natural language question to SQL"""
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="AI service not available")
+    
+    # Check knowledge base for similar patterns
+    question_lower = question.lower()
+    for item in AI_KNOWLEDGE_BASE:
+        if any(keyword in question_lower for keyword in item["text"].lower().split()):
+            logger.info("Found knowledge base match for pattern: %s", item["pattern"])
+            return {
+                "sql": item["sql"],
+                "explanation": f"Generated from knowledge base pattern: {item['pattern']}",
+                "source": "knowledge_base"
+            }
+    
+    try:
+        # Create AI prompt
+        prompt = f"""
+You are a SQL expert for an e-commerce analytics database. Convert the user's question to a DuckDB SQL query.
+
+{SCHEMA_CONTEXT}
+
+Rules:
+1. Only use SELECT statements
+2. Use read_parquet() function to access data
+3. Silver events path: '{SILVER_PARQUET_GLOB}'
+4. Gold KPIs path: '{GOLD_PARQUET_GLOB}'
+5. Always include LIMIT clause (max 1000)
+6. Use proper date/time filtering with ts or window_start columns
+
+User Question: {question}
+
+Respond with valid SQL only, no explanations:
+"""
+
+        response = openai_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a SQL expert. Respond only with valid SQL queries."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+        
+        sql = response.choices[0].message.content.strip()
+        
+        # Clean up the SQL
+        if sql.startswith("```sql"):
+            sql = sql[6:]
+        if sql.endswith("```"):
+            sql = sql[:-3]
+        sql = sql.strip()
+        
+        return {
+            "sql": sql,
+            "explanation": f"AI-generated SQL for: {question}",
+            "source": "ai_generated"
+        }
+        
+    except Exception as e:
+        logger.error("AI SQL generation failed: %s", e)
+        # Fallback to simple pattern matching
+        if "conversion" in question_lower:
+            return {
+                "sql": f"SELECT window_start, conversion_rate FROM read_parquet('{GOLD_PARQUET_GLOB}') ORDER BY window_start DESC LIMIT 60",
+                "explanation": "Fallback: conversion rate query",
+                "source": "fallback"
+            }
+        elif "revenue" in question_lower or "gmv" in question_lower:
+            return {
+                "sql": f"SELECT window_start, gmv FROM read_parquet('{GOLD_PARQUET_GLOB}') ORDER BY window_start DESC LIMIT 60",
+                "explanation": "Fallback: revenue query", 
+                "source": "fallback"
+            }
+        else:
+            return {
+                "sql": f"SELECT COUNT(*) AS total_events FROM read_parquet('{SILVER_PARQUET_GLOB}')",
+                "explanation": "Fallback: event count query",
+                "source": "fallback"
+            }
 
 
 def init_duckdb():
@@ -638,30 +786,50 @@ def validate_sql(sql: str) -> bool:
 @app.post("/query")
 async def query_data(request: Request, body: Dict[str, Any]):
     ratelimit(request)
-    question = (body.get("question") or "").lower()
+    question = (body.get("question") or "").strip()
     include_chart = bool(body.get("include_chart", True))
+    use_ai = bool(body.get("use_ai", True))
 
-    # Simple NL→SQL rules (no external deps). Add cases as needed.
-    if "conversion" in question:
-        sql = f"""
-        SELECT window_start, conversion_rate
-        FROM read_parquet('{GOLD_PARQUET_GLOB}')
-        ORDER BY window_start DESC LIMIT 60
-        """.strip()
-        explanation = "Recent conversion rate from gold_kpis"
-    elif "revenue" in question or "gmv" in question:
-        sql = f"""
-        SELECT window_start, gmv
-        FROM read_parquet('{GOLD_PARQUET_GLOB}')
-        ORDER BY window_start DESC LIMIT 60
-        """.strip()
-        explanation = "Recent GMV from gold_kpis"
-    else:
-        sql = f"SELECT COUNT(*) AS total_events FROM read_parquet('{SILVER_PARQUET_GLOB}')"
-        explanation = "Total events from silver"
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    # Generate SQL using AI or fallback to simple patterns
+    if use_ai and openai_client:
+        try:
+            sql_result = await generate_sql_from_question(question)
+            sql = sql_result["sql"]
+            explanation = sql_result["explanation"]
+            ai_source = sql_result["source"]
+        except Exception as e:
+            logger.error("AI generation failed, using fallback: %s", e)
+            use_ai = False
+    
+    if not use_ai or not openai_client:
+        # Simple NL→SQL rules (no external deps). Add cases as needed.
+        question_lower = question.lower()
+        if "conversion" in question_lower:
+            sql = f"""
+            SELECT window_start, conversion_rate
+            FROM read_parquet('{GOLD_PARQUET_GLOB}')
+            ORDER BY window_start DESC LIMIT 60
+            """.strip()
+            explanation = "Recent conversion rate from gold_kpis"
+            ai_source = "pattern_matching"
+        elif "revenue" in question_lower or "gmv" in question_lower:
+            sql = f"""
+            SELECT window_start, gmv
+            FROM read_parquet('{GOLD_PARQUET_GLOB}')
+            ORDER BY window_start DESC LIMIT 60
+            """.strip()
+            explanation = "Recent GMV from gold_kpis"
+            ai_source = "pattern_matching"
+        else:
+            sql = f"SELECT COUNT(*) AS total_events FROM read_parquet('{SILVER_PARQUET_GLOB}')"
+            explanation = "Total events from silver"
+            ai_source = "pattern_matching"
 
     if not validate_sql(sql):
-        raise HTTPException(status_code=400, detail="Unsafe or invalid SQL")
+        raise HTTPException(status_code=400, detail="Generated SQL is unsafe or invalid")
 
     tag = etag_for(sql)
     if request.headers.get("if-none-match") == tag:
@@ -688,13 +856,17 @@ async def query_data(request: Request, body: Dict[str, Any]):
 
         chart = None
         if include_chart and results:
-            names = list(results[0].keys())
-            tcols = [c for c in names if any(k in c.lower() for k in ("time", "date", "window"))]
-            ncols = [c for c in names if isinstance(results[0].get(c), (int, float))]
-            if tcols and ncols:
-                chart = {"type": "line", "x": tcols[0], "y": ncols[0], "title": f"{ncols[0]} over time"}
+            chart = generate_chart_config(sql, results, question)
 
-        payload = {"sql": sql, "results": results, "explanation": explanation, "chart_config": chart, "plan": plan_txt}
+        payload = {
+            "sql": sql, 
+            "results": results, 
+            "explanation": explanation, 
+            "chart_config": chart, 
+            "plan": plan_txt,
+            "ai_source": ai_source,
+            "question": question
+        }
         r = JSONResponse(payload)
         r.headers["ETag"] = tag
         r.headers["Cache-Control"] = "public, max-age=5"
@@ -702,6 +874,265 @@ async def query_data(request: Request, body: Dict[str, Any]):
     except Exception as e:
         logger.error("SQL exec failed: %s", e)
         raise HTTPException(status_code=400, detail=f"SQL execution error: {e}")
+
+
+def generate_chart_config(sql: str, results: List[Dict], question: str) -> Optional[Dict]:
+    """Generate intelligent chart configuration based on query results"""
+    if not results:
+        return None
+    
+    names = list(results[0].keys())
+    
+    # Find time columns
+    time_cols = [c for c in names if any(k in c.lower() for k in ("time", "date", "window", "ts"))]
+    
+    # Find numeric columns
+    numeric_cols = [c for c in names if isinstance(results[0].get(c), (int, float))]
+    
+    # Find categorical columns
+    categorical_cols = [c for c in names if c not in time_cols and c not in numeric_cols]
+    
+    question_lower = question.lower()
+    
+    # Determine chart type based on data and question
+    if time_cols and numeric_cols:
+        # Time series data
+        if "trend" in question_lower or "over time" in question_lower:
+            return {
+                "type": "line",
+                "x": time_cols[0],
+                "y": numeric_cols[0],
+                "title": f"{numeric_cols[0]} over time"
+            }
+    
+    if categorical_cols and numeric_cols and not time_cols:
+        # Category vs numeric - good for bar charts
+        if len(results) <= 20:  # Not too many categories
+            return {
+                "type": "bar", 
+                "x": categorical_cols[0],
+                "y": numeric_cols[0],
+                "title": f"{numeric_cols[0]} by {categorical_cols[0]}"
+            }
+    
+    if len(categorical_cols) >= 2 and numeric_cols:
+        # Multiple categories - could be good for scatter
+        return {
+            "type": "scatter",
+            "x": categorical_cols[0] if categorical_cols[0] in names else names[0],
+            "y": numeric_cols[0],
+            "title": f"Relationship between {categorical_cols[0]} and {numeric_cols[0]}"
+        }
+    
+    # Default fallback
+    if time_cols and numeric_cols:
+        return {
+            "type": "line",
+            "x": time_cols[0], 
+            "y": numeric_cols[0],
+            "title": f"{numeric_cols[0]} over time"
+        }
+    
+    return None
+
+# -----------------------------------------------------
+# AI-Powered Analytics Endpoints
+# -----------------------------------------------------
+
+@app.post("/ai/chat")
+async def ai_chat(request: Request, body: Dict[str, Any]):
+    """Multi-turn conversation with AI assistant"""
+    ratelimit(request)
+    
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="AI service not available")
+    
+    message = body.get("message", "").strip()
+    conversation_history = body.get("history", [])
+    
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+    
+    try:
+        # Build conversation context
+        messages = [
+            {"role": "system", "content": f"""You are an expert data analyst for an e-commerce analytics platform. 
+            
+{SCHEMA_CONTEXT}
+
+You can help with:
+- Converting questions to SQL queries
+- Explaining data patterns and trends
+- Providing business insights
+- Recommending analysis approaches
+
+Always be concise and practical in your responses."""}
+        ]
+        
+        # Add conversation history
+        for msg in conversation_history[-10:]:  # Keep last 10 messages
+            messages.append({
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", "")
+            })
+        
+        messages.append({"role": "user", "content": message})
+        
+        response = openai_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=800
+        )
+        
+        ai_response = response.choices[0].message.content
+        
+        return {
+            "response": ai_response,
+            "message": message,
+            "conversation_id": body.get("conversation_id"),
+            "model": MODEL_NAME
+        }
+        
+    except Exception as e:
+        logger.error("AI chat failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"AI chat error: {e}")
+
+@app.post("/ai/explain")
+async def ai_explain_data(request: Request, body: Dict[str, Any]):
+    """Get AI explanation of data patterns"""
+    ratelimit(request)
+    
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="AI service not available")
+    
+    data = body.get("data", [])
+    context = body.get("context", "")
+    
+    if not data:
+        raise HTTPException(status_code=400, detail="Data is required")
+    
+    try:
+        # Prepare data summary
+        data_summary = f"Data points: {len(data)}"
+        if data:
+            sample = data[:5]  # First 5 rows
+            data_summary += f"\nSample data: {json.dumps(sample, indent=2)}"
+            
+            # Basic statistics if numeric data
+            if isinstance(data[0], dict):
+                numeric_cols = [k for k, v in data[0].items() if isinstance(v, (int, float))]
+                if numeric_cols:
+                    for col in numeric_cols[:3]:  # Max 3 columns
+                        values = [row[col] for row in data if col in row and row[col] is not None]
+                        if values:
+                            avg = sum(values) / len(values)
+                            data_summary += f"\n{col}: avg={avg:.2f}, min={min(values)}, max={max(values)}"
+        
+        prompt = f"""Analyze this e-commerce data and provide insights:
+
+Context: {context}
+
+{data_summary}
+
+Provide:
+1. Key patterns or trends
+2. Business insights
+3. Potential concerns or opportunities
+4. Recommended next steps
+
+Be concise and focus on actionable insights."""
+
+        response = openai_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a data analyst providing business insights from e-commerce data."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=600
+        )
+        
+        return {
+            "explanation": response.choices[0].message.content,
+            "data_summary": data_summary,
+            "context": context
+        }
+        
+    except Exception as e:
+        logger.error("AI explanation failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"AI explanation error: {e}")
+
+@app.get("/ai/suggestions")
+async def ai_query_suggestions(request: Request):
+    """Get AI-powered query suggestions based on recent data"""
+    ratelimit(request)
+    
+    if not openai_client:
+        return {
+            "suggestions": [
+                "Show conversion rate over time",
+                "What are the top selling products?",
+                "How many users were active in the last hour?",
+                "Show revenue trend for today",
+                "Which countries have the most users?"
+            ],
+            "source": "static"
+        }
+    
+    try:
+        # Get recent metrics for context
+        metrics = await load_latest_metrics()
+        
+        context = f"""Recent metrics:
+- Latest KPIs: {json.dumps(metrics.get('latest_kpis', {}), default=str)}
+- Recent events: {json.dumps(metrics.get('recent_events', {}), default=str)}"""
+        
+        prompt = f"""Based on this e-commerce data, suggest 5 relevant analytical questions that a business user might want to ask:
+
+{context}
+
+Generate questions that would provide business value and insights. Focus on:
+- Performance trends
+- User behavior
+- Product analysis  
+- Operational metrics
+- Growth opportunities
+
+Return as a simple list, one question per line."""
+
+        response = openai_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a business analyst suggesting relevant questions for e-commerce data analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_tokens=400
+        )
+        
+        suggestions_text = response.choices[0].message.content
+        suggestions = [line.strip().lstrip('-').strip() for line in suggestions_text.split('\n') if line.strip()]
+        
+        return {
+            "suggestions": suggestions[:5],  # Max 5 suggestions
+            "source": "ai_generated",
+            "context": "Based on recent data patterns"
+        }
+        
+    except Exception as e:
+        logger.error("AI suggestions failed: %s", e)
+        # Fallback to static suggestions
+        return {
+            "suggestions": [
+                "Show conversion rate over time",
+                "What are the top selling products?", 
+                "How many users were active in the last hour?",
+                "Show revenue trend for today",
+                "Which countries have the most users?"
+            ],
+            "source": "fallback"
+        }
 
 # -----------------------------------------------------
 # SQL analysis & backfill

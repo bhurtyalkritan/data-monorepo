@@ -15,15 +15,48 @@ import Grid from '@mui/material/Grid';
 import {
   Dashboard as DashboardIcon, TrendingUp, Security, Storage, Speed,
   ExpandMore, ContentCopy, PlayArrow, Refresh, Timeline, Assessment,
-  Warning, Analytics, DataUsage, Schedule
+  Warning, Analytics, DataUsage, Schedule, SmartToy, Chat, Lightbulb,
+  Psychology, AutoAwesome, Help, Send
 } from '@mui/icons-material';
 
 // -----------------------------
 // Types (API contracts)
 // -----------------------------
 interface MetricsResponse { latest_kpis: Record<string, any>; recent_events: Record<string, number>; }
-interface QueryResponse { sql: string; results: Array<Record<string, any>>; explanation: string; plan?: string;
-  chart_config?: { type: 'line'|'bar'|'scatter', x: string, y: string, title?: string } | null; }
+interface QueryResponse { 
+  sql: string; 
+  results: Array<Record<string, any>>; 
+  explanation: string; 
+  plan?: string;
+  chart_config?: { type: 'line'|'bar'|'scatter', x: string, y: string, title?: string } | null;
+  ai_source?: string;
+  question?: string;
+}
+
+interface AIMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: Date;
+}
+
+interface AIChatResponse {
+  response: string;
+  message: string;
+  conversation_id?: string;
+  model: string;
+}
+
+interface AIExplanationResponse {
+  explanation: string;
+  data_summary: string;
+  context: string;
+}
+
+interface AISuggestionsResponse {
+  suggestions: string[];
+  source: string;
+  context?: string;
+}
 
 type DQStatus = { null_user_pct: number; quarantined_1h: number; late_1h: number };
 type Healthz = { duckdb: boolean; silver_parquet_parts: number; gold_parquet_parts: number;
@@ -177,6 +210,16 @@ const Dashboard: React.FC = () => {
   const [analysis, setAnalysis] = useState<AnalyzeResp | null>(null);
   const [backfillMsg, setBackfillMsg] = useState<string>('');
 
+  // AI-related state
+  const [aiChatMessages, setAiChatMessages] = useState<AIMessage[]>([]);
+  const [aiChatInput, setAiChatInput] = useState<string>('');
+  const [aiChatLoading, setAiChatLoading] = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
+  const [showAiChat, setShowAiChat] = useState(false);
+  const [aiExplanation, setAiExplanation] = useState<string | null>(null);
+  const [explainLoading, setExplainLoading] = useState(false);
+  const [useAi, setUseAi] = useState(true);
+
   const theme = createCustomTheme(envDark);
 
   // All useEffect hooks remain unchanged
@@ -253,16 +296,21 @@ const Dashboard: React.FC = () => {
   useEffect(() => {
     const fetchTimeSeries = async () => {
       const q = asOf ? `?limit=60&as_of=${encodeURIComponent(asOf)}` : `?limit=60`;
+      console.log('Fetching time series with query:', q, 'asOf:', asOf);
       try {
         const [c, r, f] = await Promise.all([
           fetch(`${API_URL}/trend/conversion${q}`).then(r => r.json()),
           fetch(`${API_URL}/trend/revenue${q}`).then(r => r.json()),
           fetch(`${API_URL}/forecast/conversion?limit=120&horizon=12&ma_window=7`).then(r => r.json()),
         ]);
+        console.log('Conversion trend data:', c?.results?.length, 'rows');
+        console.log('Revenue trend data:', r?.results?.length, 'rows');
         setConversionTrend(Array.isArray(c?.results) ? [...c.results].reverse() : []);
         setRevenueTrend(Array.isArray(r?.results) ? [...r.results].reverse() : []);
         setForecast(f);
-      } catch {}
+      } catch (e) {
+        console.error('Failed to fetch time series:', e);
+      }
     };
     fetchTimeSeries();
   }, [asOf]);
@@ -277,13 +325,18 @@ const Dashboard: React.FC = () => {
     run();
   }, [whatIfNode]);
 
+  // Load AI suggestions on component mount
+  useEffect(() => {
+    loadAiSuggestions();
+  }, []);
+
   // All functions remain unchanged
   const runQuery = async () => {
     try {
       setRunning(true); setError(null);
       const res = await fetch(`${API_URL}/query`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, include_chart: true })
+        body: JSON.stringify({ question, include_chart: true, use_ai: useAi })
       });
       if (res.status === 304) return;
       if (!res.ok) throw new Error(await res.text());
@@ -292,6 +345,87 @@ const Dashboard: React.FC = () => {
     } catch (e: any) {
       setError(e?.message ?? 'Query failed');
     } finally { setRunning(false); }
+  };
+
+  // AI Functions
+  const loadAiSuggestions = async () => {
+    try {
+      const res = await fetch(`${API_URL}/ai/suggestions`);
+      if (res.ok) {
+        const data: AISuggestionsResponse = await res.json();
+        setAiSuggestions(data.suggestions);
+      }
+    } catch (e) {
+      console.log('AI suggestions not available');
+    }
+  };
+
+  const sendAiChat = async () => {
+    if (!aiChatInput.trim()) return;
+    
+    const userMessage: AIMessage = {
+      role: 'user',
+      content: aiChatInput.trim(),
+      timestamp: new Date()
+    };
+    
+    setAiChatMessages(prev => [...prev, userMessage]);
+    setAiChatInput('');
+    setAiChatLoading(true);
+    
+    try {
+      const res = await fetch(`${API_URL}/ai/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userMessage.content,
+          history: aiChatMessages.slice(-10) // Last 10 messages
+        })
+      });
+      
+      if (res.ok) {
+        const data: AIChatResponse = await res.json();
+        const assistantMessage: AIMessage = {
+          role: 'assistant',
+          content: data.response,
+          timestamp: new Date()
+        };
+        setAiChatMessages(prev => [...prev, assistantMessage]);
+      } else {
+        throw new Error('AI chat not available');
+      }
+    } catch (e: any) {
+      const errorMessage: AIMessage = {
+        role: 'assistant',
+        content: 'Sorry, AI chat is not available at the moment. You can still use the natural language query interface below.',
+        timestamp: new Date()
+      };
+      setAiChatMessages(prev => [...prev, errorMessage]);
+    } finally {
+      setAiChatLoading(false);
+    }
+  };
+
+  const explainData = async (data: any[], context: string) => {
+    if (!data.length) return;
+    
+    setExplainLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/ai/explain`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data, context })
+      });
+      
+      if (res.ok) {
+        const explanation: AIExplanationResponse = await res.json();
+        setAiExplanation(explanation.explanation);
+      }
+    } catch (e) {
+      console.log('AI explanation not available');
+    } finally {
+      setExplainLoading(false);
+    }
   };
 
   const runAnalyze = async () => {
@@ -363,6 +497,14 @@ const Dashboard: React.FC = () => {
             <Typography variant="body2" sx={{ mr: 2, opacity: 0.8 }}>
               Backend: {API_URL}
             </Typography>
+            <Button
+              startIcon={<SmartToy />}
+              onClick={() => setShowAiChat(!showAiChat)}
+              color="inherit"
+              sx={{ mr: 2 }}
+            >
+              AI Assistant
+            </Button>
             <FormControlLabel
               control={
                 <Switch
@@ -377,6 +519,89 @@ const Dashboard: React.FC = () => {
         </AppBar>
 
         <Container maxWidth="xl" sx={{ py: 3 }}>
+          {/* AI Chat Panel */}
+          {showAiChat && (
+            <Card elevation={2} sx={{ mb: 3, maxHeight: 400, display: 'flex', flexDirection: 'column' }}>
+              <CardContent sx={{ pb: 1 }}>
+                <Stack direction="row" alignItems="center" justifyContent="space-between" mb={2}>
+                  <Stack direction="row" alignItems="center" spacing={1}>
+                    <SmartToy color="primary" />
+                    <Typography variant="h6" fontWeight={600}>
+                      AI Assistant
+                    </Typography>
+                  </Stack>
+                  <Button size="small" onClick={() => setShowAiChat(false)}>
+                    Close
+                  </Button>
+                </Stack>
+                
+                {/* Chat Messages */}
+                <Box 
+                  sx={{ 
+                    height: 200, 
+                    overflowY: 'auto', 
+                    border: 1, 
+                    borderColor: 'divider', 
+                    borderRadius: 1, 
+                    p: 1, 
+                    mb: 2,
+                    bgcolor: 'background.paper'
+                  }}
+                >
+                  {aiChatMessages.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary" sx={{ p: 2, textAlign: 'center' }}>
+                      Ask me anything about your data! I can help with queries, insights, and analysis.
+                    </Typography>
+                  ) : (
+                    aiChatMessages.map((msg, index) => (
+                      <Box key={index} sx={{ mb: 1 }}>
+                        <Chip 
+                          label={msg.role === 'user' ? 'You' : 'AI'}
+                          size="small"
+                          color={msg.role === 'user' ? 'primary' : 'secondary'}
+                          sx={{ mb: 0.5 }}
+                        />
+                        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                          {msg.content}
+                        </Typography>
+                      </Box>
+                    ))
+                  )}
+                  {aiChatLoading && (
+                    <Box display="flex" alignItems="center" gap={1}>
+                      <CircularProgress size={16} />
+                      <Typography variant="body2" color="text.secondary">
+                        AI thinking...
+                      </Typography>
+                    </Box>
+                  )}
+                </Box>
+
+                {/* Chat Input */}
+                <Stack direction="row" spacing={1}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    placeholder="Ask about your data..."
+                    value={aiChatInput}
+                    onChange={(e) => setAiChatInput(e.target.value)}
+                    onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && sendAiChat()}
+                    disabled={aiChatLoading}
+                  />
+                  <Button
+                    variant="contained"
+                    size="small"
+                    onClick={sendAiChat}
+                    disabled={aiChatLoading || !aiChatInput.trim()}
+                    startIcon={<Send />}
+                  >
+                    Send
+                  </Button>
+                </Stack>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Global Alert */}
           {alerts?.breach && (
             <Alert severity="error" icon={<Warning />} sx={{ mb: 3 }}>
@@ -526,27 +751,58 @@ const Dashboard: React.FC = () => {
           <Card elevation={2} sx={{ mb: 3 }}>
             <CardContent>
               <Typography variant="h6" gutterBottom fontWeight={600}>
-                Time Travel
+                Delta Lake Time Travel
               </Typography>
-              <Stack direction="row" spacing={2} alignItems="center">
+              <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
                 <TextField
                   type="datetime-local"
+                  label="View data as of"
                   value={asOf ? asOf.slice(0, -1) : ''}
                   onChange={(e) => setAsOf(e.target.value ? e.target.value + 'Z' : '')}
                   size="small"
                   InputLabelProps={{ shrink: true }}
+                  sx={{ minWidth: 200 }}
                 />
                 {asOf && (
-                  <Button
-                    variant="outlined"
-                    onClick={() => setAsOf('')}
-                    startIcon={<Refresh />}
-                    size="small"
-                  >
-                    Clear
-                  </Button>
+                  <>
+                    <Button
+                      variant="outlined"
+                      onClick={() => setAsOf('')}
+                      startIcon={<Refresh />}
+                      size="small"
+                    >
+                      Clear
+                    </Button>
+                    <Chip
+                      label={`Viewing data as of: ${new Date(asOf).toLocaleString()}`}
+                      color="primary"
+                      variant="outlined"
+                      size="small"
+                    />
+                  </>
                 )}
+                <Button
+                  variant="outlined"
+                  onClick={() => {
+                    // Set to 1 hour ago as an example
+                    const oneHourAgo = new Date();
+                    oneHourAgo.setHours(oneHourAgo.getHours() - 1);
+                    setAsOf(oneHourAgo.toISOString());
+                  }}
+                  size="small"
+                  sx={{ ml: 1 }}
+                >
+                  1 Hour Ago
+                </Button>
               </Stack>
+              {asOf && (
+                <Alert severity="info" sx={{ mt: 2 }} icon={<Timeline />}>
+                  <Typography variant="body2">
+                    <strong>Time Travel Active:</strong> Charts show historical data as it existed at {new Date(asOf).toLocaleString()}.
+                    This uses Delta Lake's time travel capabilities to query data at a specific point in time.
+                  </Typography>
+                </Alert>
+              )}
             </CardContent>
           </Card>
 
@@ -570,7 +826,17 @@ const Dashboard: React.FC = () => {
               </ChartCard>
             </Grid>
             <Grid size={{ xs: 12, lg: 6 }}>
-              <ChartCard title="Conversion Rate Trend">
+              <ChartCard 
+                title={`Conversion Rate Trend ${asOf ? '(Time Travel Active)' : ''}`}
+                action={asOf && (
+                  <Chip 
+                    label={`As of: ${new Date(asOf).toLocaleString()}`} 
+                    color="primary" 
+                    size="small" 
+                    icon={<Timeline />}
+                  />
+                )}
+              >
                 {conversionSeries.length === 0 ? (
                   <Box display="flex" alignItems="center" justifyContent="center" height="100%">
                     <Typography color="text.secondary">No data available</Typography>
@@ -582,7 +848,14 @@ const Dashboard: React.FC = () => {
                       <XAxis dataKey={queryData?.chart_config?.x || 'window_start'} tickFormatter={(v: any) => String(v).slice(11, 19)} />
                       <YAxis domain={[0, 'auto']} />
                       <Tooltip />
-                      <Line type="monotone" dataKey={queryData?.chart_config?.y || 'conversion_rate'} dot={false} stroke={theme.palette.secondary.main} strokeWidth={2} />
+                      <Line 
+                        type="monotone" 
+                        dataKey={queryData?.chart_config?.y || 'conversion_rate'} 
+                        dot={false} 
+                        stroke={asOf ? theme.palette.warning.main : theme.palette.secondary.main} 
+                        strokeWidth={2} 
+                        strokeDasharray={asOf ? "5 5" : "0"}
+                      />
                     </LineChart>
                   </ResponsiveContainer>
                 )}
@@ -590,14 +863,31 @@ const Dashboard: React.FC = () => {
             </Grid>
 
             <Grid size={{ xs: 12, lg: 6 }}>
-              <ChartCard title="Revenue Trend">
+              <ChartCard 
+                title={`Revenue Trend ${asOf ? '(Time Travel Active)' : ''}`}
+                action={asOf && (
+                  <Chip 
+                    label={`As of: ${new Date(asOf).toLocaleString()}`} 
+                    color="primary" 
+                    size="small" 
+                    icon={<Timeline />}
+                  />
+                )}
+              >
                 <ResponsiveContainer>
                   <LineChart data={revenueSeries}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="window_start" tickFormatter={(v: any) => String(v).slice(11, 19)} />
                     <YAxis domain={[0, 'auto']} />
                     <Tooltip />
-                    <Line type="monotone" dataKey="gmv" dot={false} stroke={theme.palette.success.main} strokeWidth={2} />
+                    <Line 
+                      type="monotone" 
+                      dataKey="gmv" 
+                      dot={false} 
+                      stroke={asOf ? theme.palette.warning.main : theme.palette.success.main} 
+                      strokeWidth={2} 
+                      strokeDasharray={asOf ? "5 5" : "0"}
+                    />
                   </LineChart>
                 </ResponsiveContainer>
               </ChartCard>
@@ -772,18 +1062,58 @@ const Dashboard: React.FC = () => {
           {/* Natural Language Query Interface */}
           <Card elevation={2} sx={{ mb: 3 }}>
             <CardContent>
-              <Typography variant="h6" fontWeight={600} gutterBottom>
-                Natural Language Query Interface
-              </Typography>
+              <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 2 }}>
+                <Psychology color="primary" />
+                <Typography variant="h6" fontWeight={600}>
+                  Natural Language Query Interface
+                </Typography>
+                <Chip 
+                  label={useAi ? "AI Powered" : "Pattern Matching"} 
+                  color={useAi ? "success" : "default"} 
+                  size="small"
+                />
+              </Stack>
+
+              {/* AI Suggestions */}
+              {aiSuggestions.length > 0 && (
+                <Box sx={{ mb: 2 }}>
+                  <Typography variant="subtitle2" fontWeight={600} gutterBottom>
+                    <Lightbulb fontSize="small" sx={{ mr: 0.5, verticalAlign: 'middle' }} />
+                    Suggested Questions:
+                  </Typography>
+                  <Stack direction="row" spacing={1} flexWrap="wrap" gap={1}>
+                    {aiSuggestions.map((suggestion, index) => (
+                      <Chip
+                        key={index}
+                        label={suggestion}
+                        size="small"
+                        onClick={() => setQuestion(suggestion)}
+                        clickable
+                        variant="outlined"
+                      />
+                    ))}
+                  </Stack>
+                </Box>
+              )}
 
               <Stack direction="row" spacing={2} sx={{ mb: 2 }}>
                 <TextField
                   fullWidth
                   value={question}
                   onChange={(e) => setQuestion(e.target.value)}
-                  placeholder="e.g., Show conversion rate over time"
+                  placeholder="e.g., Show conversion rate over time, What are the top products by revenue?"
                   variant="outlined"
                   size="small"
+                />
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={useAi}
+                      onChange={(e) => setUseAi(e.target.checked)}
+                      color="primary"
+                    />
+                  }
+                  label="Use AI"
                 />
                 <Button
                   variant="contained"
@@ -804,16 +1134,25 @@ const Dashboard: React.FC = () => {
 
               {queryData && (
                 <Box>
-                  <Box sx={{ mb: 2 }}>
-                    <Typography variant="subtitle2" fontWeight={600} gutterBottom>
-                      Generated SQL:
-                    </Typography>
-                    <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
-                      <Typography variant="body2" fontFamily="monospace">
-                        {queryData.sql}
+                  <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 2 }}>
+                    <Box sx={{ flex: 1 }}>
+                      <Typography variant="subtitle2" fontWeight={600} gutterBottom>
+                        Generated SQL:
                       </Typography>
-                    </Paper>
-                  </Box>
+                      <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
+                        <Typography variant="body2" fontFamily="monospace">
+                          {queryData.sql}
+                        </Typography>
+                      </Paper>
+                    </Box>
+                    {queryData.ai_source && (
+                      <Chip 
+                        label={queryData.ai_source} 
+                        color={queryData.ai_source === 'ai_generated' ? 'success' : 'default'}
+                        size="small"
+                      />
+                    )}
+                  </Stack>
 
                   <Stack direction="row" spacing={2} sx={{ mb: 2 }}>
                     <Button
@@ -824,6 +1163,18 @@ const Dashboard: React.FC = () => {
                     >
                       Copy SQL
                     </Button>
+
+                    {queryData.results.length > 0 && (
+                      <Button
+                        variant="outlined"
+                        startIcon={explainLoading ? <CircularProgress size={16} /> : <AutoAwesome />}
+                        onClick={() => explainData(queryData.results, queryData.explanation)}
+                        size="small"
+                        disabled={explainLoading}
+                      >
+                        {explainLoading ? 'Analyzing...' : 'AI Explain'}
+                      </Button>
+                    )}
 
                     <Accordion sx={{ flex: 1 }}>
                       <AccordionSummary expandIcon={<ExpandMore />}>
@@ -838,6 +1189,18 @@ const Dashboard: React.FC = () => {
                       </AccordionDetails>
                     </Accordion>
                   </Stack>
+
+                  {/* AI Explanation */}
+                  {aiExplanation && (
+                    <Alert severity="info" sx={{ mb: 2 }}>
+                      <Typography variant="subtitle2" fontWeight={600} gutterBottom>
+                        AI Insights:
+                      </Typography>
+                      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                        {aiExplanation}
+                      </Typography>
+                    </Alert>
+                  )}
 
                   <TableContainer component={Paper} variant="outlined">
                     <Table size="small">

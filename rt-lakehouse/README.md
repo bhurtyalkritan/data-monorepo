@@ -1,16 +1,46 @@
-# RT-Lakehouse: Real-Time Analytics Platform
+# 🏠 RT-Lakehouse
+## The Open Source Real-Time Data Lakehouse Platform
 
-🏠 **A complete, production-ready real-time lakehouse analytics platform with AI-powered insights**
+[![CI/CD Pipeline](https://github.com/bhurtyalkritan/data-monorepo/actions/workflows/rt-lakehouse.yml/badge.svg)](https://github.com/bhurtyalkritan/data-monorepo/actions/workflows/rt-lakehouse.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docker Pulls](https://img.shields.io/docker/pulls/rt-lakehouse/assistant)](https://hub.docker.com/r/rt-lakehouse/assistant)
+[![Community](https://img.shields.io/badge/Join-Community-blue)](https://github.com/bhurtyalkritan/data-monorepo/discussions)
 
-## What You Get
+> **Build a complete real-time analytics platform in under 5 minutes**  
+> Production-ready lakehouse with AI-powered insights, zero vendor lock-in
 
-- **📊 Real-time streaming pipeline**: Kafka → Bronze → Silver → Gold on Delta Lake with exactly-once processing
-- **🤖 AI Assistant**: Natural language to SQL with auto-generated charts and guardrails
-- **🌐 Modern dashboards**: React frontend + Streamlit monitoring with real-time updates
-- **🔧 Full automation**: One command starts everything with Docker Compose orchestration
-- **🚀 Open source**: No vendor lock-in (DuckDB, Qdrant, OpenRouter/OpenAI)
-- **⚡ Production features**: Health monitoring, auto-scaling, schema evolution, ACID transactions
-- **🛡️ Enterprise ready**: SQL injection protection, logging, error handling, service discovery
+## 🚀 Why RT-Lakehouse?
+
+**The Problem**: Companies spend months and millions building real-time analytics platforms. Existing solutions are either too expensive (Databricks, Snowflake) or too complex (rolling your own with 20+ tools).
+
+**The Solution**: RT-Lakehouse gives you everything you need in one Docker Compose file:
+
+✅ **Real-time streaming** (Kafka → Delta Lake)  
+✅ **ACID transactions** with schema evolution  
+✅ **AI-powered natural language queries**  
+✅ **Auto-generated visualizations**  
+✅ **Production monitoring** and health checks  
+✅ **Enterprise security** and data governance  
+✅ **One-command deployment** anywhere  
+
+## 💫 What Makes This Different
+
+| Feature | RT-Lakehouse | Databricks | Snowflake | DIY Solution |
+|---------|--------------|------------|-----------|--------------|
+| **Setup Time** | 5 minutes | Weeks | Weeks | Months |
+| **Monthly Cost** | $0 | $10,000+ | $15,000+ | $50,000+ |
+| **Vendor Lock-in** | None | High | High | None |
+| **AI Integration** | Built-in | Add-on | Add-on | Custom |
+| **Local Development** | ✅ | ❌ | ❌ | Complex |
+| **Production Ready** | ✅ | ✅ | ✅ | Depends |
+
+## 🎯 Perfect For
+
+- **Startups** building their first real-time analytics
+- **Enterprises** reducing cloud costs and vendor lock-in  
+- **Data Engineers** learning modern lakehouse architecture
+- **Developers** prototyping real-time applications
+- **Students** studying distributed systems and AI
 
 ## Quick Start
 

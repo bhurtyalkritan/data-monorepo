@@ -19,7 +19,7 @@ import {
 } from '@mui/icons-material';
 
 // -----------------------------
-// Types (API contracts) - unchanged
+// Types (API contracts)
 // -----------------------------
 interface MetricsResponse { latest_kpis: Record<string, any>; recent_events: Record<string, number>; }
 interface QueryResponse { sql: string; results: Array<Record<string, any>>; explanation: string; plan?: string;

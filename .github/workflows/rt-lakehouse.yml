@@ -1,0 +1,426 @@
+name: RT-Lakehouse CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'rt-lakehouse/**'
+      - '.github/workflows/rt-lakehouse.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'rt-lakehouse/**'
+      - '.github/workflows/rt-lakehouse.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/rt-lakehouse
+
+jobs:
+  # Detect changes to determine what needs to be built
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.changes.outputs.frontend }}
+      backend: ${{ steps.changes.outputs.backend }}
+      services: ${{ steps.changes.outputs.services }}
+      pipelines: ${{ steps.changes.outputs.pipelines }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            frontend:
+              - 'rt-lakehouse/services/frontend/**'
+            backend:
+              - 'rt-lakehouse/services/assistant_api.py'
+              - 'rt-lakehouse/services/requirements-assistant.txt'
+            services:
+              - 'rt-lakehouse/services/**'
+              - 'rt-lakehouse/docker-compose.yml'
+            pipelines:
+              - 'rt-lakehouse/pipelines/**'
+              - 'rt-lakehouse/producers/**'
+
+  # Lint and format check
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install Python dependencies
+        run: |
+          pip install black flake8 isort mypy
+          pip install -r rt-lakehouse/services/requirements-assistant.txt
+          
+      - name: Lint Python code
+        run: |
+          cd rt-lakehouse
+          flake8 services/ pipelines/ producers/ --max-line-length=100 --ignore=E203,W503
+          black --check services/ pipelines/ producers/
+          isort --check-only services/ pipelines/ producers/
+          
+      - name: Type check with mypy
+        run: |
+          cd rt-lakehouse
+          mypy services/assistant_api.py --ignore-missing-imports
+          
+      - name: Set up Node.js
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: rt-lakehouse/services/frontend/package-lock.json
+          
+      - name: Install frontend dependencies
+        if: needs.changes.outputs.frontend == 'true'
+        run: |
+          cd rt-lakehouse/services/frontend
+          npm ci
+          
+      - name: Lint frontend code
+        if: needs.changes.outputs.frontend == 'true'
+        run: |
+          cd rt-lakehouse/services/frontend
+          npm run lint
+          npm run type-check
+
+  # Security scanning
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'rt-lakehouse/'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Unit and integration tests
+  test:
+    runs-on: ubuntu-latest
+    needs: [changes]
+    services:
+      kafka:
+        image: confluentinc/cp-kafka:7.4.0
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+        ports:
+          - 9092:9092
+          
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.4.0
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+        ports:
+          - 2181:2181
+          
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov pytest-asyncio
+          pip install -r rt-lakehouse/services/requirements-assistant.txt
+          pip install -r rt-lakehouse/services/requirements-producer.txt
+          
+      - name: Set up test environment
+        run: |
+          cd rt-lakehouse
+          mkdir -p data/delta data/checkpoints
+          
+      - name: Run Python tests
+        env:
+          KAFKA_BOOTSTRAP: localhost:9092
+          DUCKDB_PATH: ":memory:"
+        run: |
+          cd rt-lakehouse
+          pytest tests/ -v --cov=services/ --cov=pipelines/ --cov=producers/ --cov-report=xml
+          
+      - name: Run frontend tests
+        if: needs.changes.outputs.frontend == 'true'
+        run: |
+          cd rt-lakehouse/services/frontend
+          npm ci
+          npm test -- --coverage --watchAll=false
+          
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          directory: rt-lakehouse/
+          flags: rt-lakehouse
+
+  # Build Docker images
+  build:
+    runs-on: ubuntu-latest
+    needs: [changes, lint, test]
+    if: always() && (needs.lint.result == 'success' && needs.test.result == 'success')
+    strategy:
+      matrix:
+        service: [assistant, frontend, monitoring, producer, spark]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: rt-lakehouse/
+          file: rt-lakehouse/services/Dockerfile.${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # Integration testing with full stack
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: always() && needs.build.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Create test environment file
+        run: |
+          cd rt-lakehouse
+          cat > .env.test << EOF
+          KAFKA_BOOTSTRAP=kafka:29092
+          KAFKA_TOPIC=ecommerce_events_test
+          EVENTS_PER_SEC=50
+          DUCKDB_PATH=/delta/test_lakehouse.db
+          OPENROUTER_API_KEY=test_key
+          EOF
+          
+      - name: Start services
+        run: |
+          cd rt-lakehouse
+          docker-compose -f docker-compose.yml -f docker-compose.test.yml up -d
+          
+      - name: Wait for services
+        run: |
+          sleep 60
+          
+      - name: Run integration tests
+        run: |
+          cd rt-lakehouse
+          # Test API health
+          curl -f http://localhost:8000/health || exit 1
+          
+          # Test frontend availability
+          curl -f http://localhost:3000 || exit 1
+          
+          # Test monitoring dashboard
+          curl -f http://localhost:8501/health || exit 1
+          
+          # Test data pipeline
+          python test_time_travel.py
+          
+      - name: Check service logs
+        if: failure()
+        run: |
+          cd rt-lakehouse
+          docker-compose logs
+          
+      - name: Cleanup
+        if: always()
+        run: |
+          cd rt-lakehouse
+          docker-compose down -v
+
+  # Performance testing
+  performance:
+    runs-on: ubuntu-latest
+    needs: [integration-test]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install locust requests
+          
+      - name: Start minimal services for testing
+        run: |
+          cd rt-lakehouse
+          docker-compose up -d assistant-api
+          sleep 30
+          
+      - name: Run performance tests
+        run: |
+          cd rt-lakehouse
+          cat > locustfile.py << 'EOF'
+          from locust import HttpUser, task, between
+          
+          class ApiUser(HttpUser):
+              wait_time = between(1, 3)
+              
+              @task(3)
+              def get_metrics(self):
+                  self.client.get("/metrics")
+                  
+              @task(2)
+              def get_health(self):
+                  self.client.get("/health")
+                  
+              @task(1)
+              def get_trends(self):
+                  self.client.get("/trend/conversion?limit=10")
+          EOF
+          
+          locust --host=http://localhost:8000 -u 10 -r 2 -t 60s --headless --csv=performance
+          
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: rt-lakehouse/performance_*
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [integration-test]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # Add your staging deployment logic here
+          # For example, using kubectl, docker-compose, or cloud provider CLI
+          
+      - name: Run smoke tests
+        run: |
+          # Wait for deployment
+          sleep 60
+          
+          # Test critical endpoints
+          curl -f ${{ vars.STAGING_URL }}/health || exit 1
+          curl -f ${{ vars.STAGING_URL }}/metrics || exit 1
+          
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: "RT-Lakehouse staging deployment: ${{ job.status }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, performance]
+    if: github.ref == 'refs/heads/main' && github.event.inputs.environment == 'production'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Create deployment artifact
+        run: |
+          cd rt-lakehouse
+          tar -czf rt-lakehouse-${{ github.sha }}.tar.gz \
+            docker-compose.yml \
+            services/ \
+            pipelines/ \
+            sql/ \
+            docs/
+            
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: rt-lakehouse-deployment
+          path: rt-lakehouse/rt-lakehouse-${{ github.sha }}.tar.gz
+          
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          # Add your production deployment logic here
+          
+      - name: Run production smoke tests
+        run: |
+          sleep 120
+          curl -f ${{ vars.PRODUCTION_URL }}/health || exit 1
+          
+      - name: Notify production deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: "🚀 RT-Lakehouse production deployment successful!"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Cleanup old images
+  cleanup:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Delete old container images
+        uses: actions/delete-package-versions@v4
+        with:
+          package-name: rt-lakehouse-assistant
+          package-type: container
+          min-versions-to-keep: 5
+          delete-only-untagged-versions: true

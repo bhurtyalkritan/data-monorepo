@@ -1,0 +1,30 @@
+# Docker Compose override for testing
+version: '3.8'
+
+services:
+  # Test-specific configurations
+  producer:
+    environment:
+      - EVENTS_PER_SEC=50
+      - KAFKA_TOPIC=ecommerce_events_test
+    
+  spark-streaming:
+    environment:
+      - KAFKA_TOPIC=ecommerce_events_test
+      - DUCKDB_PATH=/delta/test_lakehouse.db
+    volumes:
+      - ./data/test:/delta
+      - ./data/test-checkpoints:/checkpoints
+    
+  assistant-api:
+    environment:
+      - DUCKDB_PATH=/delta/test_lakehouse.db
+    volumes:
+      - ./data/test:/delta
+    
+  monitoring:
+    environment:
+      - DUCKDB_PATH=/delta/test_lakehouse.db
+      - ASSISTANT_URL=http://assistant-api:8000
+    volumes:
+      - ./data/test:/delta
